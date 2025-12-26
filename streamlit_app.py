@@ -6,7 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 # ================= 配置区：已根据你提供的信息修正 =================
-CF_API_TOKEN = "cb8ef9355c4081b04c3fbc0d65370f95".strip()
+CF_API_TOKEN = "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm".strip()
 ZONE_ID = "7aa1c1ddfd9df2690a969d9f977f82ae".strip()
 RECORD_ID = "efc4c37be906c8a19a67808e51762c1f".strip()
 
