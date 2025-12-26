@@ -1,112 +1,159 @@
 import streamlit as st
 import requests
-import json
+import threading
 import time
+import urllib.parse
+from datetime import datetime
 
 # ==========================================
-# 1. 配置中心 (建议实际使用时通过 st.secrets 或环境变量读取)
+# 1. 配置中心 (请替换为你的实际信息)
 # ==========================================
 CF_CONFIG = {
-    "email": "your_email@example.com",
     "api_token": "你的_Cloudflare_API_Token",
     "zone_id": "你的_Zone_ID",
-    "record_name": "nodes.yourdomain.com" # 你要优选到的域名
+    "record_name": "nodes.yourdomain.com",  # 你要更新的二级域名
 }
 
+# 你提供的 VLESS 链接列表（支持粘贴多个）
+VLESS_LINKS = [
+    "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@162.159.136.0:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
+    "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@188.114.97.1:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
+    "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@141.101.120.5:2053/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp#%E7%BE%8E%E5%9B%BD70",
+    # ... 你可以继续添加更多链接
+]
+
 # ==========================================
-# 2. API 逻辑抽离 (Cloudflare 管理类)
+# 2. 核心逻辑类 (API + 测速 + 自动化)
 # ==========================================
-class CFManager:
-    def __init__(self, config):
+class AutoOptimizer:
+    def __init__(self, config, links):
         self.config = config
+        self.links = links
         self.headers = {
             "Authorization": f"Bearer {config['api_token']}",
             "Content-Type": "application/json"
         }
-        self.base_url = "https://api.cloudflare.com/client/v4"
+        self.best_ip = "等待测速..."
+        self.last_update = "尚未运行"
+        self.status_log = []
+        self.is_running = False
 
-    def get_record_info(self):
-        """获取 DNS 记录的 ID 和当前内容"""
-        url = f"{self.base_url}/zones/{self.config['zone_id']}/dns_records?name={self.config['record_name']}"
-        try:
-            resp = requests.get(url, headers=self.headers).json()
-            if resp.get("success") and len(resp["result"]) > 0:
-                return resp["result"][0] # 返回第一个匹配的记录
-            return None
-        except Exception as e:
-            st.error(f"获取 DNS 信息失败: {e}")
-            return None
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.status_log.append(f"[{timestamp}] {message}")
+        if len(self.status_log) > 15: self.status_log.pop(0)
 
-    def update_dns(self, record_id, new_ip):
-        """执行 DNS 更新"""
-        url = f"{self.base_url}/zones/{self.config['zone_id']}/dns_records/{record_id}"
-        data = {
-            "type": "A",
-            "name": self.config['record_name'],
-            "content": new_ip,
-            "ttl": 60,
-            "proxied": False # 优选通常不开启小云朵
-        }
+    def parse_ips(self):
+        """解析 VLESS 列表提取 IP"""
+        ips = []
+        for link in self.links:
+            try:
+                parts = urllib.parse.urlparse(link)
+                ip = parts.netloc.split('@')[-1].split(':')[0]
+                ips.append(ip)
+            except: continue
+        return list(set(ips))
+
+    def get_latency(self, ip):
+        """测试 IP 延迟 (TCP 连接测试)"""
         try:
-            resp = requests.put(url, headers=self.headers, json=data).json()
-            return resp.get("success")
+            start = time.time()
+            # 使用较小的 timeout 快速跳过无效 IP
+            requests.get(f"https://{ip}", timeout=1.5, verify=False)
+            return int((time.time() - start) * 1000)
+        except:
+            return 9999
+
+    def update_cf_dns(self, ip):
+        """更新 Cloudflare DNS 记录"""
+        base_url = "https://api.cloudflare.com/client/v4"
+        # 1. 获取记录 ID
+        list_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records?name={self.config['record_name']}"
+        try:
+            res = requests.get(list_url, headers=self.headers).json()
+            if not res.get("success") or not res["result"]:
+                self.log(f"❌ 未找到域名 {self.config['record_name']} 的解析记录")
+                return False
+            
+            record_id = res["result"][0]["id"]
+            current_ip = res["result"][0]["content"]
+
+            if current_ip == ip:
+                self.log("✅ CF 记录已是最优，无需重复更新")
+                return True
+
+            # 2. 执行更新
+            update_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records/{record_id}"
+            data = {"type": "A", "name": self.config['record_name'], "content": ip, "ttl": 60, "proxied": False}
+            put_res = requests.put(update_url, headers=self.headers, json=data).json()
+            return put_res.get("success")
         except Exception as e:
-            st.error(f"更新失败: {e}")
+            self.log(f"❌ API 异常: {str(e)}")
             return False
 
+    def run_forever(self):
+        """自动化循环线程"""
+        self.is_running = True
+        while True:
+            self.log("🔄 开始新一轮自动优选...")
+            ips = self.parse_ips()
+            
+            results = []
+            for ip in ips:
+                delay = self.get_latency(ip)
+                if delay < 9999:
+                    results.append((ip, delay))
+            
+            if results:
+                results.sort(key=lambda x: x[1])
+                top_ip = results[0][0]
+                self.log(f"🏆 最优 IP 锁定: {top_ip} ({results[0][1]}ms)")
+                
+                if self.update_cf_dns(top_ip):
+                    self.best_ip = top_ip
+                    self.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.log(f"🚀 已自动同步到 Cloudflare")
+            else:
+                self.log("⚠️ 测速失败，未发现有效节点")
+            
+            self.log("💤 进入休眠，10分钟后再次巡检...")
+            time.sleep(600) # 每 10 分钟运行一次
+
 # ==========================================
-# 3. Streamlit UI 界面
+# 3. Streamlit UI 展现层
 # ==========================================
 def main():
-    st.set_page_config(page_title="CF 节点自动优选器", page_icon="⚡")
-    st.title("🚀 CF 节点自动优选系统")
-    
-    # 初始化 API 经理
-    cf = CFManager(CF_CONFIG)
+    st.set_page_config(page_title="CF 自动化优选", page_icon="⚡")
+    st.title("🛡️ Cloudflare 节点自动巡检系统")
 
-    # 侧边栏：状态显示
-    st.sidebar.header("配置状态")
-    st.sidebar.info(f"目标域名: \n`{CF_CONFIG['record_name']}`")
+    # 单例模式启动后台线程
+    if 'optimizer' not in st.session_state:
+        st.session_state.optimizer = AutoOptimizer(CF_CONFIG, VLESS_LINKS)
+        thread = threading.Thread(target=st.session_state.optimizer.run_forever, daemon=True)
+        thread.start()
 
-    # 主界面布局
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🔍 扫描当前最优 IP"):
-            with st.status("正在测速优选...", expanded=True) as status:
-                st.write("正在连接测试服务器...")
-                time.sleep(1) # 模拟测速耗时
-                
-                # 这里假设你已经有了优选逻辑，我们先模拟一个结果
-                best_ip = "104.16.123.45" 
-                
-                st.write(f"找到最优 IP: {best_ip}")
-                status.update(label="扫描完成!", state="complete")
-                st.session_state['best_ip'] = best_ip
+    opt = st.session_state.optimizer
 
-    if 'best_ip' in st.session_state:
-        st.success(f"当前推荐 IP: **{st.session_state['best_ip']}**")
-        
-        with col2:
-            if st.button("🛠️ 自动同步到 Cloudflare"):
-                record = cf.get_record_info()
-                if record:
-                    old_ip = record['content']
-                    if old_ip == st.session_state['best_ip']:
-                        st.warning("CF 记录已是最优，无需更新。")
-                    else:
-                        success = cf.update_dns(record['id'], st.session_state['best_ip'])
-                        if success:
-                            st.balloons()
-                            st.success(f"同步成功！已从 {old_ip} 更新至 {st.session_state['best_ip']}")
-                        else:
-                            st.error("同步失败，请检查 API Token 权限。")
-                else:
-                    st.error("未找到对应的 DNS 记录，请先在 CF 后台手动创建该 A 记录。")
+    # 仪表盘
+    col1, col2, col3 = st.columns(3)
+    col1.metric("当前最优 IP", opt.best_ip)
+    col2.metric("待监测节点数", len(set(VLESS_LINKS)))
+    col3.metric("最后更新", opt.last_update.split(" ")[-1])
 
-    # 底部展示
     st.divider()
-    st.caption("编码助手提供支持 | 保持高效，保持简洁")
+
+    # 日志显示
+    st.subheader("⚙️ 自动化运行日志")
+    log_container = st.container(height=300)
+    with log_container:
+        for entry in reversed(opt.status_log):
+            if "❌" in entry: st.error(entry)
+            elif "🚀" in entry: st.success(entry)
+            else: st.text(entry)
+
+    # 自动刷新 UI (每 10 秒)
+    time.sleep(10)
+    st.rerun()
 
 if __name__ == "__main__":
     main()
