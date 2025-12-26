@@ -9,9 +9,9 @@ from datetime import datetime
 # 1. 配置中心 (请替换为你的实际信息)
 # ==========================================
 CF_CONFIG = {
-    "api_token": "你的_Cloudflare_API_Token",
-    "zone_id": "你的_Zone_ID",
-    "record_name": "nodes.yourdomain.com",  # 你要更新的二级域名
+    "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm": "7aa1c1ddfd9df2690a969d9f977f82ae",
+    "zone_id": "efc4c37be906c8a19a67808e51762c1f",
+    "speed": "nodes.yourdomain.com",  #speed
 }
 
 # 你提供的 VLESS 链接列表（支持粘贴多个）
