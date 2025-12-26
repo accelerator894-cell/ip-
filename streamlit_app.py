@@ -2,9 +2,9 @@ import streamlit as st
 import requests
 
 # 填入你从 CF 获取的信息
-CF_API_TOKEN = "你的API令牌"
-ZONE_ID = "你的区域ID"  # 在域名概述页右下角找到
-RECORD_ID = "你的记录ID" # 需要通过 API 查询或查看网页源代码获取
+CF_API_TOKEN = "R4LIwzWqfuJ8JSN4vTRYEPKLPJxruc-wPwf2EWlD"
+ZONE_ID = "cb8ef9355c4081b04c3fbc0d65370f95"  # 在域名概述页右下角找到
+RECORD_ID = "efc4c37be906c8a19a67808e51762c1f" # 需要通过 API 查询或查看网页源代码获取
 
 def update_dns(new_ip):
     url = f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{RECORD_ID}"
