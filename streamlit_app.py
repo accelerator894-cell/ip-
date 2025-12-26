@@ -5,11 +5,13 @@ import time
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-# ================= 配置区：请确保这里没有任何多余的空格 =================
+# ================= 配置区：已根据你提供的信息修正 =================
 CF_API_TOKEN = "cb8ef9355c4081b04c3fbc0d65370f95".strip()
 ZONE_ID = "7aa1c1ddfd9df2690a969d9f977f82ae".strip()
 RECORD_ID = "efc4c37be906c8a19a67808e51762c1f".strip()
-DNS_NAME = "speed.milet.qzz.io"
+
+# 注意：这里建议只写前缀 "speed"，如果之前报错，请改回这个
+DNS_NAME = "speed" 
 # =============================================================
 
 # 候选 IP 段
@@ -36,11 +38,13 @@ def get_best_ip():
 
 def update_dns(new_ip):
     url = f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{RECORD_ID}"
+    
+    # 构造请求头，确保 Authorization 后面只有一个空格
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json; charset=utf-8"
+        "Content-Type": "application/json"
     }
-    # 构造标准 JSON 数据
+    
     payload = {
         "type": "A",
         "name": DNS_NAME,
@@ -50,7 +54,7 @@ def update_dns(new_ip):
     }
     
     try:
-        # 使用 json= 参数自动处理编码
+        # 使用 json=payload 会自动处理 utf-8 编码，无需手动指定
         response = requests.put(url, headers=headers, json=payload, timeout=10)
         return response.status_code == 200, response.text
     except Exception as e:
@@ -66,12 +70,13 @@ if st.button("发现最快 IP，立即同步到云端", type="primary"):
         if best_ip:
             st.info(f"找到最快 IP: {best_ip} (延迟: {latency:.2f}ms)")
             
-            success, error_msg = update_dns(best_ip)
+            success, result_text = update_dns(best_ip)
             if success:
                 st.success(f"✅ 解析同步成功！已指向 {best_ip}")
                 st.balloons()
             else:
-                st.error(f"❌ 同步失败。错误详情: {error_msg}")
+                # 如果失败，把具体错误打印出来
+                st.error(f"❌ 同步失败。CF 返回信息: {result_text}")
         else:
             st.error("❌ 未能找到可用 IP，请稍后重试。")
 
