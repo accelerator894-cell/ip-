@@ -105,47 +105,4 @@ class AutoOptimizer:
             if results:
                 results.sort(key=lambda x: x[1])
                 top_ip = results[0][0]
-                self.log(f"🏆 锁定最优: {top_ip} ({results[0][1]}ms)")
-                if self.update_cf_dns(top_ip):
-                    self.best_ip = top_ip
-                    self.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                self.log("⚠️ 测速无响应，等待下一轮")
-            
-            self.log("💤 进入休眠周期（10分钟）")
-            time.sleep(600)
-
-# ==========================================
-# 3. Streamlit 展现层
-# ==========================================
-def main():
-    st.set_page_config(page_title="CF 自动化部署", layout="centered")
-    st.title("⚡ 节点优选自动巡检系统")
-
-    if 'opt' not in st.session_state:
-        st.session_state.opt = AutoOptimizer(CF_CONFIG, VLESS_LINKS)
-        threading.Thread(target=st.session_state.opt.run_forever, daemon=True).start()
-
-    opt = st.session_state.opt
-
-    # 指标状态
-    m1, m2 = st.columns(2)
-    m1.metric("当前运行 IP", opt.best_ip)
-    m2.metric("最后同步", opt.last_update.split(" ")[-1] if " " in opt.last_update else "等待中")
-
-    st.divider()
-
-    # 动态日志显示
-    st.subheader("⚙️ 自动化实时日志")
-    log_area = st.container(height=350, border=True)
-    with log_area:
-        for msg in reversed(opt.status_log):
-            if "🚀" in msg or "✅" in msg: st.success(msg)
-            elif "❌" in msg or "⚠️" in msg: st.error(msg)
-            else: st.code(msg)
-
-    time.sleep(5)
-    st.rerun()
-
-if __name__ == "__main__":
-    main()
+                self.log(f"🏆 锁定最优: {top_ip} ({results[0]
