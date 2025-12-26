@@ -6,31 +6,30 @@ import urllib.parse
 from datetime import datetime
 
 # ==========================================
-# 1. 配置中心 (已按正确逻辑修正)
+# 1. 配置中心 (请严格按照这个格式填写)
 # ==========================================
 CF_CONFIG = {
-    # 名字(Key)必须是固定的字符串，内容(Value)填入你的实际参数
+    # 名字(Key)是固定的，请把你的实际数据填在右边的引号里
     "api_token": "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm", 
     "zone_id": "7aa1c1ddfd9df2690a969d9f977f82ae",
     "record_name": "speed.milet.qzz.io", 
 }
 
-# 待监测的 VLESS 链接库
+# 你的 VLESS 链接库
 VLESS_LINKS = [
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@162.159.136.0:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@188.114.97.1:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@141.101.120.5:2053/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp#%E7%BE%8E%E5%9B%BD70",
-    # 你可以继续在此添加更多链接...
 ]
 
 # ==========================================
-# 2. 自动化管理逻辑 (API + 测速)
+# 2. 自动化管理逻辑
 # ==========================================
 class AutoOptimizer:
     def __init__(self, config, links):
         self.config = config
         self.links = links
-        # 强制清理 Token 字符串防止 latin-1 报错
+        # 强制清理 Token 字符串，防止 latin-1 报错
         self.token = str(config.get("api_token", "")).strip()
         self.headers = {
             "Authorization": f"Bearer {self.token}",
@@ -46,15 +45,16 @@ class AutoOptimizer:
         if len(self.status_log) > 12: self.status_log.pop(0)
 
     def update_cf_dns(self, ip):
-        """自动化 DNS 同步逻辑"""
+        """自动查询并更新 Cloudflare DNS"""
         base_url = "https://api.cloudflare.com/client/v4"
         try:
             self.log("🛰️ 正在从 Cloudflare 获取记录信息...")
+            # 自动搜索对应的 Record ID
             list_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records?name={self.config['record_name']}"
             res = requests.get(list_url, headers=self.headers, timeout=10).json()
             
             if not res.get("success"):
-                err = res.get('errors')[0]['message'] if res.get('errors') else "未知 API 错误"
+                err = res.get('errors')[0]['message'] if res.get('errors') else "API 权限或 Token 错误"
                 self.log(f"❌ API 报错: {err}")
                 return False
 
@@ -64,7 +64,7 @@ class AutoOptimizer:
             
             record = res["result"][0]
             if record["content"] == ip:
-                self.log(f"✅ CF 记录已是 {ip}，无需更新")
+                self.log(f"✅ CF 记录已是 {ip}，无需操作")
                 return True
 
             self.log(f"🛠️ 发现更优 IP，开始同步: {ip}")
@@ -83,10 +83,8 @@ class AutoOptimizer:
             return False
 
     def run_forever(self):
-        """后台无限循环任务"""
         while True:
-            self.log("🔄 开始一轮自动优选巡检...")
-            # 解析链接提取 IP
+            self.log("🔄 开始一轮自动巡检...")
             ips = []
             for link in self.links:
                 try:
@@ -94,7 +92,6 @@ class AutoOptimizer:
                     ips.append(p.netloc.split('@')[-1].split(':')[0])
                 except: continue
             
-            # 简单 TCP 测速
             results = []
             for ip in set(ips):
                 try:
@@ -107,7 +104,6 @@ class AutoOptimizer:
                 results.sort(key=lambda x: x[1])
                 top_ip = results[0][0]
                 self.log(f"🏆 锁定最优 IP: {top_ip} ({results[0][1]}ms)")
-                
                 if self.update_cf_dns(top_ip):
                     self.best_ip = top_ip
                     self.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -118,38 +114,35 @@ class AutoOptimizer:
             time.sleep(600)
 
 # ==========================================
-# 3. Streamlit UI 界面
+# 3. Streamlit UI 展现
 # ==========================================
 def main():
-    st.set_page_config(page_title="CF 节点自动管理", page_icon="⚡")
-    st.title("🛡️ 节点自动优选同步系统")
+    st.set_page_config(page_title="CF 节点自动巡检", page_icon="⚡")
+    st.title("🛡️ 自动优选同步系统")
 
-    # 单例启动后台线程
-    if 'opt' not in st.session_state:
-        st.session_state.opt = AutoOptimizer(CF_CONFIG, VLESS_LINKS)
-        threading.Thread(target=st.session_state.opt.run_forever, daemon=True).start()
+    # 确保单例运行
+    if 'optimizer' not in st.session_state:
+        st.session_state.optimizer = AutoOptimizer(CF_CONFIG, VLESS_LINKS)
+        threading.Thread(target=st.session_state.optimizer.run_forever, daemon=True).start()
 
-    opt = st.session_state.opt
+    opt = st.session_state.optimizer
 
-    # 指标看板
-    c1, c2, c3 = st.columns(3)
-    c1.metric("当前生效 IP", opt.best_ip)
-    c2.metric("监测节点总数", len(set(VLESS_LINKS)))
-    c3.metric("最后更新时间", opt.last_update.split(" ")[-1] if " " in opt.last_update else "等待中")
+    m1, m2 = st.columns(2)
+    m1.metric("当前生效 IP", opt.best_ip)
+    m2.metric("最后更新", opt.last_update.split(" ")[-1] if " " in opt.last_update else "等待中")
 
     st.divider()
 
-    # 运行日志
     st.subheader("⚙️ 自动化运行日志")
-    log_container = st.container(height=350, border=True)
-    with log_container:
+    log_area = st.container(height=400, border=True)
+    with log_area:
         for msg in reversed(opt.status_log):
             if "🚀" in msg or "✅" in msg: st.success(msg)
             elif "❌" in msg or "⚠️" in msg: st.error(msg)
             else: st.code(msg)
 
-    # 自动刷新 (每 10 秒刷新一次前端界面)
-    time.sleep(10)
+    # 自动刷新页面 (每5秒)
+    time.sleep(5)
     st.rerun()
 
 if __name__ == "__main__":
