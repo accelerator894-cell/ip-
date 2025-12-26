@@ -6,12 +6,12 @@ import urllib.parse
 from datetime import datetime
 
 # ==========================================
-# 1. 配置中心 (请务必在此核对你的信息)
+# 1. 配置中心 (已修正键值对逻辑)
 # ==========================================
 CF_CONFIG = {
-    "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm": "你的_Cloudflare_API_Token", 
-    "7aa1c1ddfd9df2690a969d9f977f82ae": "你的_Zone_ID",
-    "efc4c37be906c8a19a67808e51762c1f": "speed.milet.qzz.io",   # 必须是你在 CF 后台已经存在的 A 记录
+    "api_token": "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm", 
+    "zone_id": "7aa1c1ddfd9df2690a969d9f977f82ae",
+    "record_name": "speed.milet.qzz.io", 
 }
 
 # 你的 VLESS 链接列表
@@ -19,7 +19,6 @@ VLESS_LINKS = [
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@162.159.136.0:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@188.114.97.1:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@141.101.120.5:2053/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp#%E7%BE%8E%E5%9B%BD70",
-    # ... 粘贴更多 ...
 ]
 
 # ==========================================
@@ -29,7 +28,8 @@ class AutoOptimizer:
     def __init__(self, config, links):
         self.config = config
         self.links = links
-        self.token = str(config['api_token']).strip()
+        # 修正：通过正确的 Key 获取内容
+        self.token = str(config.get('api_token', '')).strip()
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json"
@@ -44,7 +44,6 @@ class AutoOptimizer:
         if len(self.status_log) > 12: self.status_log.pop(0)
 
     def update_cf_dns(self, ip):
-        """核心修复：增加每一步的日志输出"""
         base_url = "https://api.cloudflare.com/client/v4"
         try:
             self.log(f"🛰️ 正在从 CF 获取域名记录信息...")
@@ -52,7 +51,8 @@ class AutoOptimizer:
             res = requests.get(list_url, headers=self.headers, timeout=10).json()
             
             if not res.get("success"):
-                self.log(f"❌ API 报错: {res.get('errors')[0].get('message')}")
+                err_msg = res.get('errors')[0].get('message') if res.get('errors') else "未知错误"
+                self.log(f"❌ API 报错: {err_msg}")
                 return False
 
             if not res["result"]:
@@ -60,15 +60,12 @@ class AutoOptimizer:
                 return False
             
             record = res["result"][0]
-            record_id = record["id"]
-            current_ip = record["content"]
-
-            if current_ip == ip:
+            if record["content"] == ip:
                 self.log(f"✅ 当前 CF 记录已经是 {ip}，无需更新")
                 return True
 
-            self.log(f"🛠️ 发现新 IP，正在更新: {current_ip} -> {ip}")
-            update_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records/{record_id}"
+            self.log(f"🛠️ 发现新 IP，正在更新: {record['content']} -> {ip}")
+            update_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records/{record['id']}"
             data = {"type": "A", "name": self.config['record_name'], "content": ip, "ttl": 60, "proxied": False}
             put_res = requests.put(update_url, headers=self.headers, json=data, timeout=10).json()
             
@@ -85,7 +82,6 @@ class AutoOptimizer:
     def run_loop(self):
         while True:
             self.log("🔄 开始自动优选巡检...")
-            # 解析 IP
             ips = []
             for link in self.links:
                 try:
@@ -93,11 +89,11 @@ class AutoOptimizer:
                     ips.append(p.netloc.split('@')[-1].split(':')[0])
                 except: continue
             
-            # 简单测速 (TCP 握手)
             results = []
             for ip in set(ips):
                 try:
                     start = time.time()
+                    # 测速请求
                     requests.get(f"https://{ip}", timeout=1.5, verify=False)
                     results.append((ip, int((time.time() - start) * 1000)))
                 except: continue
@@ -106,8 +102,6 @@ class AutoOptimizer:
                 results.sort(key=lambda x: x[1])
                 top_ip = results[0][0]
                 self.log(f"🏆 锁定最优: {top_ip} ({results[0][1]}ms)")
-                
-                # 执行同步
                 if self.update_cf_dns(top_ip):
                     self.best_ip = top_ip
                     self.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -130,14 +124,12 @@ def main():
 
     opt = st.session_state.optimizer
 
-    # 顶部指标
     c1, c2 = st.columns(2)
     c1.metric("当前生效 IP", opt.best_ip)
     c2.metric("最后同步", opt.last_update.split(" ")[-1] if " " in opt.last_update else "等待中")
 
     st.divider()
 
-    # 日志输出
     st.subheader("⚙️ 运行日志")
     for msg in reversed(opt.status_log):
         if "❌" in msg or "⚠️" in msg: st.error(msg)
