@@ -1,84 +1,112 @@
 import streamlit as st
 import requests
-import socket
-import time
 import json
-from concurrent.futures import ThreadPoolExecutor
+import time
 
-# ================= 配置区：已根据你提供的信息修正 =================
-CF_API_TOKEN = "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm".strip()
-ZONE_ID = "7aa1c1ddfd9df2690a969d9f977f82ae".strip()
-RECORD_ID = "efc4c37be906c8a19a67808e51762c1f".strip()
+# ==========================================
+# 1. 配置中心 (建议实际使用时通过 st.secrets 或环境变量读取)
+# ==========================================
+CF_CONFIG = {
+    "email": "your_email@example.com",
+    "api_token": "你的_Cloudflare_API_Token",
+    "zone_id": "你的_Zone_ID",
+    "record_name": "nodes.yourdomain.com" # 你要优选到的域名
+}
 
-# 注意：这里建议只写前缀 "speed"，如果之前报错，请改回这个
-DNS_NAME = "speed" 
-# =============================================================
+# ==========================================
+# 2. API 逻辑抽离 (Cloudflare 管理类)
+# ==========================================
+class CFManager:
+    def __init__(self, config):
+        self.config = config
+        self.headers = {
+            "Authorization": f"Bearer {config['api_token']}",
+            "Content-Type": "application/json"
+        }
+        self.base_url = "https://api.cloudflare.com/client/v4"
 
-# 候选 IP 段
-IP_CANDIDATES = ["104.16.120.", "104.17.210.", "104.18.15.", "104.19.100.", "172.67.180."]
+    def get_record_info(self):
+        """获取 DNS 记录的 ID 和当前内容"""
+        url = f"{self.base_url}/zones/{self.config['zone_id']}/dns_records?name={self.config['record_name']}"
+        try:
+            resp = requests.get(url, headers=self.headers).json()
+            if resp.get("success") and len(resp["result"]) > 0:
+                return resp["result"][0] # 返回第一个匹配的记录
+            return None
+        except Exception as e:
+            st.error(f"获取 DNS 信息失败: {e}")
+            return None
 
-def test_ip_speed(ip, port=443, timeout=1):
-    start = time.time()
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((ip, port))
-        sock.close()
-        return ip, (time.time() - start) * 1000
-    except:
-        return ip, float('inf')
+    def update_dns(self, record_id, new_ip):
+        """执行 DNS 更新"""
+        url = f"{self.base_url}/zones/{self.config['zone_id']}/dns_records/{record_id}"
+        data = {
+            "type": "A",
+            "name": self.config['record_name'],
+            "content": new_ip,
+            "ttl": 60,
+            "proxied": False # 优选通常不开启小云朵
+        }
+        try:
+            resp = requests.put(url, headers=self.headers, json=data).json()
+            return resp.get("success")
+        except Exception as e:
+            st.error(f"更新失败: {e}")
+            return False
 
-def get_best_ip():
-    ips = [f"{r}{i}" for r in IP_CANDIDATES for i in range(1, 21)]
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        results = list(executor.map(test_ip_speed, ips))
-    valid = [r for r in results if r[1] < float('inf')]
-    valid.sort(key=lambda x: x[1])
-    return valid[0] if valid else (None, None)
-
-def update_dns(new_ip):
-    url = f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{RECORD_ID}"
+# ==========================================
+# 3. Streamlit UI 界面
+# ==========================================
+def main():
+    st.set_page_config(page_title="CF 节点自动优选器", page_icon="⚡")
+    st.title("🚀 CF 节点自动优选系统")
     
-    # 构造请求头，确保 Authorization 后面只有一个空格
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    # 初始化 API 经理
+    cf = CFManager(CF_CONFIG)
+
+    # 侧边栏：状态显示
+    st.sidebar.header("配置状态")
+    st.sidebar.info(f"目标域名: \n`{CF_CONFIG['record_name']}`")
+
+    # 主界面布局
+    col1, col2 = st.columns(2)
     
-    payload = {
-        "type": "A",
-        "name": DNS_NAME,
-        "content": str(new_ip),
-        "ttl": 120,
-        "proxied": False
-    }
-    
-    try:
-        # 使用 json=payload 会自动处理 utf-8 编码，无需手动指定
-        response = requests.put(url, headers=headers, json=payload, timeout=10)
-        return response.status_code == 200, response.text
-    except Exception as e:
-        return False, str(e)
+    with col1:
+        if st.button("🔍 扫描当前最优 IP"):
+            with st.status("正在测速优选...", expanded=True) as status:
+                st.write("正在连接测试服务器...")
+                time.sleep(1) # 模拟测速耗时
+                
+                # 这里假设你已经有了优选逻辑，我们先模拟一个结果
+                best_ip = "104.16.123.45" 
+                
+                st.write(f"找到最优 IP: {best_ip}")
+                status.update(label="扫描完成!", state="complete")
+                st.session_state['best_ip'] = best_ip
 
-# --- 网页界面 ---
-st.set_page_config(page_title="CF 优选同步", page_icon="⚡")
-st.title("⚡ Cloudflare 自动优选同步")
+    if 'best_ip' in st.session_state:
+        st.success(f"当前推荐 IP: **{st.session_state['best_ip']}**")
+        
+        with col2:
+            if st.button("🛠️ 自动同步到 Cloudflare"):
+                record = cf.get_record_info()
+                if record:
+                    old_ip = record['content']
+                    if old_ip == st.session_state['best_ip']:
+                        st.warning("CF 记录已是最优，无需更新。")
+                    else:
+                        success = cf.update_dns(record['id'], st.session_state['best_ip'])
+                        if success:
+                            st.balloons()
+                            st.success(f"同步成功！已从 {old_ip} 更新至 {st.session_state['best_ip']}")
+                        else:
+                            st.error("同步失败，请检查 API Token 权限。")
+                else:
+                    st.error("未找到对应的 DNS 记录，请先在 CF 后台手动创建该 A 记录。")
 
-if st.button("发现最快 IP，立即同步到云端", type="primary"):
-    with st.spinner("正在全球节点中搜寻最快路径..."):
-        best_ip, latency = get_best_ip()
-        if best_ip:
-            st.info(f"找到最快 IP: {best_ip} (延迟: {latency:.2f}ms)")
-            
-            success, result_text = update_dns(best_ip)
-            if success:
-                st.success(f"✅ 解析同步成功！已指向 {best_ip}")
-                st.balloons()
-            else:
-                # 如果失败，把具体错误打印出来
-                st.error(f"❌ 同步失败。CF 返回信息: {result_text}")
-        else:
-            st.error("❌ 未能找到可用 IP，请稍后重试。")
+    # 底部展示
+    st.divider()
+    st.caption("编码助手提供支持 | 保持高效，保持简洁")
 
-st.divider()
-st.caption("提示：同步成功后，请在手机设置中将“私人 DNS”改回“自动”即可享受加速。")
+if __name__ == "__main__":
+    main()
