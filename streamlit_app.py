@@ -18,7 +18,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 基础配置与文件 IO (确保原子化写入)
+# 1. 基础配置与路径
 # ===========================
 st.set_page_config(page_title="Cloudflare 猎手进化版", page_icon="🧬", layout="wide")
 
@@ -31,6 +31,7 @@ CONFIG_FILE = "app_config.json"
 QUICK_SEEDS = ["104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1"]
 GOLDEN_SUBNETS = ["104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", "172.64.0.0/13"]
 
+# 文件安全读写工具
 def safe_write_json(path, data):
     tmp = path + ".tmp"
     try:
@@ -47,26 +48,26 @@ def safe_read_json(path, default):
     except: return default
 
 # ===========================
-# 2. 爬虫补位管理 (保留垃圾清理功能)
+# 2. 爬虫池补位管理
 # ===========================
 
 class PoolManager:
     @staticmethod
     def trigger_fill():
-        """检测到垃圾节点或到达周期时触发补位"""
+        """同时启动爬虫和冷门挖掘"""
         threading.Thread(target=PoolManager.fill_crawler, daemon=True).start()
         threading.Thread(target=PoolManager.fill_niche, daemon=True).start()
 
     @staticmethod
     def fill_crawler():
         ips = safe_read_json(CRAWLER_FILE, [])
-        if len(ips) >= 20: return
+        if len(ips) >= 25: return # 略微扩容以应对全量扫描
         try:
             r = requests.get("https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt", timeout=3)
             found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', r.text)
             random.shuffle(found)
             for ip in found:
-                if len(ips) >= 20: break
+                if len(ips) >= 25: break
                 if ip not in ips: ips.append(ip)
             safe_write_json(CRAWLER_FILE, ips)
         except: pass
@@ -74,50 +75,54 @@ class PoolManager:
     @staticmethod
     def fill_niche():
         ips = safe_read_json(NICHE_FILE, [])
-        if len(ips) >= 20: return
+        if len(ips) >= 25: return
         new_ips = []
         for _ in range(15):
             try:
                 net = ipaddress.ip_network(random.choice(GOLDEN_SUBNETS))
                 new_ips.append(str(net.network_address + random.randint(1, net.num_addresses - 2)))
             except: pass
-        ips = list(set(ips + new_ips))[:20]
+        ips = list(set(ips + new_ips))[:25]
         safe_write_json(NICHE_FILE, ips)
 
 # ===========================
-# 3. 独立进化引擎 (三级跳 + 5分钟普查 + 自动更换)
+# 3. 独立进化引擎 (5分钟全量扫描核心)
 # ===========================
 
 def background_evolution():
     start_time = time.time()
-    last_full_scan = 0
+    last_full_scan = 0 # 记录上一次5分钟全量扫描时间
     db_data = safe_read_json(DB_FILE, {})
     
     while True:
         try:
             now = time.time()
             cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443})
-            elapsed = now - start_time
             
-            # --- 阶段 A: 判断扫描深度 (5分钟一次全量普查) ---
+            # --- 阶段 A: 判断是否触发 5 分钟全量扫描 ---
             is_full_scan = (now - last_full_scan >= 300) 
             
-            # --- 阶段 B: 目标收集 (保留三级跳极速启动) ---
+            # --- 阶段 B: 目标收集 ---
             targets = []
             if is_full_scan:
-                targets += [{"ip": i['ip'], "src": "📂 基因普查"} for i in db_data.values()]
+                # 全量扫描：测试所有历史、爬虫和本地数据
+                all_history = list(db_data.values())
+                targets += [{"ip": i['ip'], "src": "📂 基因普查"} for i in all_history]
+                targets += [{"ip": ip, "src": "🕷️ 爬虫全检"} for ip in safe_read_json(CRAWLER_FILE, [])]
+                targets += [{"ip": ip, "src": "💎 冷门全检"} for ip in safe_read_json(NICHE_FILE, [])]
                 last_full_scan = now
             else:
+                # 常规扫描：极速轮询
                 top_20 = sorted(db_data.values(), key=lambda x: x.get('score', 0), reverse=True)[:20]
                 targets += [{"ip": ip, "src": "⚡ 本地种子"} for ip in QUICK_SEEDS]
-                if elapsed > 8: targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in top_20]
-                if elapsed > 3: targets += [{"ip": ip, "src": "🕷️ 爬虫发现"} for ip in safe_read_json(CRAWLER_FILE, [])[:10]]
+                targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in top_20]
+                targets += [{"ip": ip, "src": "🕷️ 爬虫发现"} for ip in safe_read_json(CRAWLER_FILE, [])[:10]]
 
-            # --- 阶段 C: 测试并自动更换优胜劣汰 ---
+            # --- 阶段 C: 极速并发测试 (自动更换逻辑) ---
             current_results = []
-            down_bytes = 20000 if elapsed < 15 else 200000
+            workers = 40 if is_full_scan else 20 # 全量扫描时加大并发
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
                 def test_task(t):
                     ip = t['ip']
                     try:
@@ -129,24 +134,16 @@ def background_evolution():
                     speed = 0.0
                     try:
                         st_t = time.perf_counter()
-                        r = requests.get(f"http://{ip}/__down?bytes={down_bytes}", headers={"Host": cfg['host']}, timeout=1.5)
+                        r = requests.get(f"http://{ip}/__down?bytes=150000", headers={"Host": cfg['host']}, timeout=1.5)
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 识别国家地区并打标
-                    geo = {"cc": "CN", "country": "四川电信测速中"} if elapsed < 15 else {"cc": "UN", "country": "Unknown"}
-                    if elapsed >= 15:
-                        try:
-                            g = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,country", timeout=1).json()
-                            geo = {"cc": g.get("countryCode","UN"), "country": g.get("country","Unknown")}
-                        except: pass
-
+                    # 自动评分与质量更换
                     score = round(100 - p_avg/5 + min(speed*5, 35), 1)
                     res = {"ip": ip, "score": score, "avg": p_avg, "speed": round(speed, 2), 
-                           "src": t['src'], "cc": geo['cc'], "country": geo['country'], 
-                           "last_test": datetime.now().strftime("%H:%M:%S")}
+                           "src": t['src'], "last_test": datetime.now().strftime("%H:%M:%S")}
                     
-                    # 【自动更换】逻辑：如果测试出的分数更高，则更新数据库
+                    # 【自动更换】若新评分更高，则立即覆盖精英库数据
                     if score >= db_data.get(ip, {}).get('score', 0): db_data[ip] = res
                     return res
 
@@ -163,90 +160,54 @@ def background_evolution():
                             "is_full": is_full_scan
                         })
 
+            # 周期性补充爬虫数据
             PoolManager.trigger_fill()
             safe_write_json(DB_FILE, db_data)
             
         except: pass
-        time.sleep(10)
+        time.sleep(10 if not is_full_scan else 30) # 全量扫描后多休息一会儿
 
+# 启动后台引擎
 if "evolution_engine" not in st.session_state:
     threading.Thread(target=background_evolution, daemon=True).start()
     st.session_state.evolution_engine = True
 
 # ===========================
-# 4. 前端渲染 (还原截图 UI)
+# 4. 前端展示 (可视化全量扫描状态)
 # ===========================
 
-# --- 侧边栏 (还原 1000036579.jpg) ---
 with st.sidebar:
-    st.markdown("### 🛠️ 配置控制台")
-    cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443, "uuid": "", "ws_path": "/"})
+    st.header("🛠️ 配置控制台")
+    cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443})
+    new_mode = st.radio("优选策略", ["☀️ 正常使用排位", "⚡ 极速低延迟", "🤖 GPT 独享专线", "🎬 流媒体解锁专线"], 
+                        index=0)
     
-    modes = ["☀️ 正常使用排位", "⚡ 极速低延迟", "🤖 GPT 独享专线", "🎬 流媒体解锁专线"]
-    new_mode = st.radio("优选策略", modes, index=modes.index(cfg['mode']) if cfg['mode'] in modes else 0)
-    
-    # 还原 VLESS 参数折叠面板
-    with st.expander("🔑 VLESS 参数设置"):
-        new_uuid = st.text_input("UUID", value=cfg.get("uuid", ""))
-        new_host = st.text_input("伪装域名 (Host)", value=cfg.get("host", "speed.cloudflare.com"))
-        new_path = st.text_input("WS 路径", value=cfg.get("ws_path", "/"))
-        new_port = st.number_input("端口", value=cfg.get("port", 443))
-        
-    if st.button("💾 保存配置并重启进化"):
-        safe_write_json(CONFIG_FILE, {"mode": new_mode, "host": new_host, "port": new_port, "uuid": new_uuid, "ws_path": new_path})
-        st.toast(f"切换至: {new_mode}", icon="⚡")
-        if os.path.exists(RESULT_FILE): os.remove(RESULT_FILE)
+    if st.button("💾 保存配置并应用"):
+        safe_write_json(CONFIG_FILE, {"mode": new_mode, "host": cfg['host'], "port": cfg['port']})
+        st.toast(f"✅ 策略已更新: {new_mode}")
         time.sleep(0.5); st.rerun()
-    
-    st.info("ℹ️ 后台正在自动从互联网和历史数据库中寻找最佳 IP，无需人工干预。")
 
-# --- 主界面 ---
+st.title("🧬 Cloudflare 猎手进化版")
 data = safe_read_json(RESULT_FILE, None)
 
 if data:
     w = data['winner']
-    st.title("🧬 Cloudflare 猎手进化版")
-    
-    # 还原状态标记
+    # 动态显示扫描模式
     scan_tag = "🚀 全量普查中" if data.get('is_full') else "📡 实时监测中"
     st.markdown(f"### 🏆 当前最强 IP: `{w['ip']}` | 状态: `{scan_tag}`")
     
-    # 还原冠军指标卡片
-    c1, c2, c3 = st.columns(3)
-    c1.metric("进化得分", w['score'])
-    c2.metric("延迟 ms", w['avg'])
-    c3.metric("速度 MB/s", w['speed'])
-    
-    st.markdown(f"**特性标签:** 🎮 游戏/金融 ⚡ 极速 🤖 GPT 🏳️ {w['cc']}")
-    
     st.divider()
-    st.subheader(f"🧬 基因库排行 (策略: {data['mode']})")
-    
-    # 还原数据表格
     df = pd.DataFrame(data['table'])
-    
-    def format_src(src):
-        if "种子" in src: return "⚡ 本地种子"
-        if "历史" in src: return "📂 历史优选"
-        return f"🕷️ {src}"
-
-    df['分类来源'] = df['src'].apply(format_src)
-    df['地理位置'] = df['cc'] + " " + df['country']
-
     st.dataframe(
-        df,
-        column_order=("score", "分类来源", "ip", "地理位置", "avg", "speed", "last_test"),
+        df[['score', 'src', 'ip', 'avg', 'speed', 'last_test']],
         column_config={
-            "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=100),
-            "speed": st.column_config.NumberColumn("速度 MB/s"),
-            "avg": st.column_config.NumberColumn("延迟 ms")
+            "score": st.column_config.ProgressColumn("进化评分", min_value=0, max_value=100),
+            "src": "分类标记",
         },
         use_container_width=True, hide_index=True
     )
-    st.caption(f"上次更新: {data['last_run']} | 每 5 分钟全量扫描并自动更换更优节点")
+    st.caption(f"上次演化更新: {data['last_run']} | 每 5 分钟执行一次全量数据普查与自动更换")
     time.sleep(5); st.rerun()
 else:
-    # 还原启动信息
-    st.title("🧬 Cloudflare 猎手进化版")
-    st.info("🚀 正在为您极速连接四川电信骨干网并加载本地基因库... (初次约需 10 秒)")
+    st.info("🚀 正在激活三级跳引擎... 首次加载约需 10 秒。")
     time.sleep(2); st.rerun()
