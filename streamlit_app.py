@@ -31,6 +31,13 @@ CONFIG_FILE = "app_config.json"
 QUICK_SEEDS = ["104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1"]
 GOLDEN_SUBNETS = ["104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", "172.64.0.0/13"]
 
+# 国家代码转中文映射表
+COUNTRY_CN = {
+    "CN": "中国", "HK": "香港", "TW": "台湾", "US": "美国", "JP": "日本",
+    "SG": "新加坡", "KR": "韩国", "DE": "德国", "GB": "英国", "FR": "法国",
+    "CA": "加拿大", "AU": "澳大利亚", "NL": "荷兰", "RU": "俄罗斯", "IN": "印度"
+}
+
 def safe_write_json(path, data):
     tmp = path + ".tmp"
     try:
@@ -47,7 +54,7 @@ def safe_read_json(path, default):
     except: return default
 
 # ===========================
-# 2. 后台进化引擎 (三级跳 + 普查 + 自动更换)
+# 2. 后台进化引擎
 # ===========================
 
 def background_evolution():
@@ -60,11 +67,8 @@ def background_evolution():
             now = time.time()
             cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443})
             elapsed = now - start_time
-            
-            # --- 阶段 A: 判断扫描模式 (5分钟普查) ---
             is_full_scan = (now - last_full_scan >= 300) 
             
-            # --- 阶段 B: 目标收集 ---
             targets = []
             if is_full_scan:
                 targets += [{"ip": i['ip'], "src": "📂 基因普查"} for i in db_data.values()]
@@ -75,7 +79,6 @@ def background_evolution():
                 if elapsed > 8: targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in top_20]
                 if elapsed > 3: targets += [{"ip": ip, "src": "🕷️ 爬虫发现"} for ip in safe_read_json(CRAWLER_FILE, [])]
 
-            # --- 阶段 C: 极速流水线测试 ---
             current_results = []
             down_bytes = 20000 if elapsed < 15 else 200000
             
@@ -95,19 +98,20 @@ def background_evolution():
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 地理位置增强获取
-                    geo = {"cc": "UN", "country": "Unknown", "city": ""}
+                    # 获取地理位置并转化为中文
+                    geo_cn = "未知"
+                    cc = "UN"
                     try:
-                        g = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,country,city", timeout=1.2).json()
-                        geo = {"cc": g.get("countryCode","UN"), "country": g.get("country","Unknown"), "city": g.get("city","")}
+                        g = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,country", timeout=1.2).json()
+                        cc = g.get("countryCode","UN")
+                        geo_cn = COUNTRY_CN.get(cc, g.get("country", "未知"))
                     except: pass
 
                     score = round(100 - p_avg/5 + min(speed*5, 35), 1)
                     res = {"ip": ip, "score": score, "avg": p_avg, "speed": round(speed, 2), 
-                           "src": t['src'], "cc": geo['cc'], "country": geo['country'], "city": geo['city'],
+                           "src": t['src'], "cc": cc, "country_cn": geo_cn,
                            "last_test": datetime.now().strftime("%H:%M:%S")}
                     
-                    # 自动更换逻辑
                     if score >= db_data.get(ip, {}).get('score', 0): db_data[ip] = res
                     return res
 
@@ -129,10 +133,10 @@ def background_evolution():
 
 if "evolution_engine" not in st.session_state:
     threading.Thread(target=background_evolution, daemon=True).start()
-    st.session_state.evolution_engine = True
+    st.session_state.bg_evolution = True
 
 # ===========================
-# 3. 前端界面复原与增强
+# 3. 前端界面
 # ===========================
 
 with st.sidebar:
@@ -159,37 +163,37 @@ if data:
     w = data['winner']
     st.title("🧬 Cloudflare 猎手进化版")
     
-    # 顶部冠军卡片增强
-    scan_tag = "🚀 全量普查中" if data.get('is_full') else "📡 实时监测中"
-    st.markdown(f"### 🏆 冠军 IP: `{w['ip']}` | 状态: `{scan_tag}`")
+    # 顶部冠军卡片
+    scan_tag = "实时监测中" if not data.get('is_full') else "全量普查中"
+    st.markdown(f"### 🏆 冠军 IP: `{w['ip']}` | 状态: 🛰️ `{scan_tag}`")
     
-    # 【新增】IP 选择与复制功能
     st.code(w['ip'], language="text")
     st.caption("👆 点击上方代码框即可快速复制冠军 IP")
     
-    # 地理位置详细显示
-    st.markdown(f"📍 **当前位置:** {w.get('cc', 'UN')} - {w.get('country', 'Unknown')} {w.get('city', '')}")
+    # 地理位置中文显示
+    st.markdown(f"📍 **当前位置:** {w.get('cc', 'UN')} - {w.get('country_cn', '未知')}")
     
     c1, c2, c3 = st.columns(3)
-    c1.metric("进化得分", w['score'])
+    c1.metric("进化评分", w['score'])
     c2.metric("延迟 ms", w['avg'])
     c3.metric("速度 MB/s", w['speed'])
     
     st.divider()
     
-    # 修复 KeyError 标题逻辑
+    # 基因库排行标题
     st.subheader(f"🧬 基因库排行 (策略: {data.get('mode', '默认')})")
     
     df = pd.DataFrame(data['table'])
-    df['分类来源'] = df['src'].apply(lambda x: f"⚡ {x}" if "种子" in x else (f"📂 {x}" if "历史" in x else f"🕷️ {x}"))
-    df['地理位置'] = df.apply(lambda x: f"{x.get('cc', 'UN')} {x.get('country', 'Unk')}", axis=1)
+    # 分类标记与地理位置中文转换
+    df['分类标记'] = df['src'].apply(lambda x: f"⚡ {x}" if "种子" in x else (f"📂 {x}" if "历史" in x else f"🕷️ {x}"))
+    df['国家'] = df['country_cn']
 
     st.dataframe(
         df,
-        column_order=("score", "分类来源", "ip", "地理位置", "avg", "speed", "last_test"),
+        column_order=("score", "分类标记", "ip", "国家", "avg", "speed", "last_test"),
         column_config={
             "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=100),
-            "ip": st.column_config.TextColumn("IP 地址"),
+            "avg": st.column_config.NumberColumn("延迟 ms"),
             "speed": st.column_config.NumberColumn("速度 MB/s"),
         },
         use_container_width=True, hide_index=True
@@ -198,5 +202,5 @@ if data:
     time.sleep(5); st.rerun()
 else:
     st.title("🧬 Cloudflare 猎手进化版")
-    st.info("🚀 正在为您极速连接四川电信骨干网并加载本地基因库... (约需 10 秒)")
+    st.info("🚀 正在为您极速连接四川电信骨干网并加载本地基因库... (初次约需 10 秒)")
     time.sleep(2); st.rerun()
