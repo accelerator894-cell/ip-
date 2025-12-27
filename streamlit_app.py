@@ -10,7 +10,6 @@ from datetime import datetime
 st.set_page_config(page_title="CF 安全调试台", page_icon="🔧", layout="centered")
 
 st.title("🔧 Cloudflare 安全调试模式")
-st.write("如果看到这段文字，说明程序已成功启动。")
 
 # --- 2. 逐步读取配置 (带状态显示) ---
 st.info("第一步：读取 Secrets 配置...")
@@ -52,7 +51,7 @@ def manual_sync(ip):
             st.write("正在列出该 Zone ID 下真实存在的前 5 条记录，请核对：")
             # 调试：列出真实记录
             debug_recs = requests.get(url, headers=headers, params={"per_page": 5}).json()
-            for r in debug_recs['result']:
+            for r in debug_recs.get('result', []):
                 st.code(f"记录名: {r['name']} | 类型: {r['type']}")
             return
 
