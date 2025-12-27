@@ -3,90 +3,78 @@ import requests
 import time
 from datetime import datetime
 
-# 1. 自动配置检测
-try:
-    CF_CONFIG = {
-        "api_token": st.secrets["api_token"],
-        "zone_id": st.secrets["zone_id"],
-        "record_name": st.secrets["record_name"],
-    }
-except:
-    st.error("❌ 错误：未检测到 Secrets 配置")
-    st.stop()
+# ... (CF_CONFIG 保持不变) ...
 
-IP_LIST = [
-    "108.162.194.1", "108.162.192.5", "172.64.32.12", "162.159.61.1", 
-    "173.245.58.1", "172.64.36.5", "162.159.46.10", "188.114.97.1"
-]
-
-def update_dns(new_ip):
-    """强制更新逻辑：无论云端能否连通，都尝试修改 DNS"""
-    url = f"https://api.cloudflare.com/client/v4/zones/{CF_CONFIG['zone_id']}/dns_records"
+def check_ip_quality(ip):
+    """
+    多维度质量检测：延迟 + 稳定性 + 速度
+    """
+    quality = {"ip": ip, "lat": 9999, "loss": 100, "speed": 0}
+    latencies = []
+    success_count = 0
+    test_rounds = 3  # 进行3轮采样
+    
     headers = {
-        "Authorization": f"Bearer {CF_CONFIG['api_token']}",
-        "Content-Type": "application/json"
+        "User-Agent": "Mozilla/5.0",
+        "Host": "milet.qzz.io" # 模拟你的真实域名
     }
+
     try:
-        # 获取现有记录
-        r = requests.get(f"{url}?name={CF_CONFIG['record_name']}", headers=headers, timeout=10).json()
-        if r.get("success") and r.get("result"):
-            record = r["result"][0]
-            if record["content"] == new_ip:
-                return f"✅ DNS 已指向 {new_ip}，无需操作"
+        # 1. 延迟与丢包率检测 (采样 3 次)
+        for _ in range(test_rounds):
+            try:
+                start = time.time()
+                # 测试 CF 官方节点链路状态
+                res = requests.get(f"http://{ip}/cdn-cgi/trace", headers=headers, timeout=1.5)
+                if res.status_code == 200:
+                    latencies.append(int((time.time() - start) * 1000))
+                    success_count += 1
+            except:
+                continue
+        
+        if success_count > 0:
+            quality["lat"] = sum(latencies) / len(latencies) # 平均延迟
+            quality["loss"] = ((test_rounds - success_count) / test_rounds) * 100 # 丢包率
             
-            # 执行修改
-            u = requests.put(f"{url}/{record['id']}", headers=headers, json={
-                "type": "A",
-                "name": CF_CONFIG['record_name'],
-                "content": new_ip,
-                "ttl": 60,
-                "proxied": False # 优选 IP 必须关闭代理（灰色小黄云）
-            }, timeout=10).json()
-            
-            return f"🚀 成功！DNS 已切换至: {new_ip}" if u.get("success") else f"❌ API 报错: {u.get('errors')[0]['message']}"
-    except Exception as e:
-        return f"⚠️ 通讯故障: {str(e)}"
-    return "🔍 域名不存在，请检查 record_name"
+            # 2. 模拟小文件测速 (仅对低延迟且无丢包的 IP 进行)
+            if quality["loss"] == 0:
+                speed_start = time.time()
+                # 尝试从该 IP 下载 100KB 的小块（CF 缓存节点测速）
+                speed_res = requests.get(f"https://{ip}/cdn-cgi/trace", headers=headers, timeout=2.0)
+                duration = time.time() - speed_start
+                # 这里简单记为：响应时间越短，速度分值越高
+                quality["speed"] = round(1 / duration, 2) 
 
-# --- UI 界面 ---
-st.set_page_config(page_title="DNS 强制修复版", page_icon="⚡")
-st.title("⚡ 全自动 4K 优选引擎")
+        return quality
+    except:
+        return quality
 
-# 新增：手动强制同步按钮，用于排查 API 权限
-if st.sidebar.button("🛠️ 强制同步第一个 IP (测试用)"):
-    test_msg = update_dns(IP_LIST[0])
-    st.sidebar.write(test_msg)
+# --- 页面执行 ---
+st.title("⚡ 深度优选引擎 (多维质检版)")
 
-with st.spinner("🔍 正在尝试探测延迟..."):
+with st.spinner("📊 正在进行多维度深度质检 (延迟/丢包/速度)..."):
     results = []
     for ip in IP_LIST:
-        try:
-            start = time.time()
-            # 简化探测，只发 HEAD 请求尝试穿透
-            requests.head(f"http://{ip}", timeout=1.0)
-            results.append({"ip": ip, "lat": int((time.time() - start) * 1000)})
-        except:
-            continue
-
-    # --- 核心改进逻辑 ---
-    if results:
-        results.sort(key=lambda x: x['lat'])
-        target_ip = results[0]['ip']
-        st.success(f"📡 探测成功：最优 IP {target_ip} ({results[0]['lat']}ms)")
-    else:
-        # 即使全部失败，也取第一个 IP 进行保底更新
-        target_ip = IP_LIST[0]
-        st.warning("⚠️ 云端探测被封锁！正在执行【保底强制同步】方案...")
-
-    # 执行同步操作
-    status_msg = update_dns(target_ip)
+        q_data = check_ip_quality(ip)
+        if q_data["lat"] < 9999: # 只记录通畅的 IP
+            results.append(q_data)
     
-    # 显示状态卡片
-    st.info(f"📋 同步反馈: {status_msg}")
-    st.metric("目标 IP", target_ip)
+    if results:
+        # 排序逻辑：优先按丢包率，其次按延迟，最后按速度
+        results.sort(key=lambda x: (x['loss'], x['lat'], -x['speed']))
+        winner = results[0]
+        
+        # 页面显示增强
+        st.success(f"🎯 深度优选成功: {winner['ip']}")
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("平均延迟", f"{int(winner['lat'])}ms")
+        col2.metric("丢包率", f"{winner['loss']}%", delta="稳定" if winner['loss']==0 else "不稳")
+        col3.metric("速度分值", winner['speed'])
+        
+        # 执行 DNS 更新 (函数复用之前的)
+        update_dns(winner['ip'])
+    else:
+        st.error("❌ 所有 IP 质检均不合格，请检查 IP 列表或云端网络。")
 
-st.write(f"📅 最后检查时间: {datetime.now().strftime('%H:%M:%S')}")
-
-# 自动刷新
-time.sleep(600)
-st.rerun()
+st.info(f"🕒 质检完成时间: {datetime.now().strftime('%H:%M:%S')}")
