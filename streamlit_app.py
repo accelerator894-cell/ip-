@@ -12,216 +12,324 @@ import socket
 from datetime import datetime
 import urllib3
 
-# 禁用警告
+# 禁用 HTTPS 证书警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置
+# 1. 页面配置与样式
 # ===========================
-st.set_page_config(page_title="VLESS 可视化监控台", page_icon="📊", layout="wide")
+st.set_page_config(page_title="VLESS 全能监控指挥台", page_icon="🛸", layout="wide")
 
-# 注入一点样式让图表更好看
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
-    div[data-testid="metric-container"] {
-        background-color: #1a1c24;
-        border: 1px solid #333;
-        padding: 10px;
-        border-radius: 8px;
-    }
+    div[data-testid="column"] { background-color: #15171e; border: 1px solid #262730; border-radius: 8px; padding: 15px; }
     </style>
     """, unsafe_allow_html=True)
 
-RESULT_FILE = "scan_results.json"
-SAVED_IP_FILE = "good_ips.txt"
+# 文件路径定义
+RESULT_FILE = "scan_results.json"  # 存放给前端展示的结果
+CONFIG_FILE = "app_config.json"    # 存放用户的模式设置
+SAVED_IP_FILE = "good_ips.txt"     # 本地优选历史库 (你要求的本地数据筛选)
 
 # ===========================
-# 2. 核心工具函数 (保持极速版逻辑)
+# 2. 基础工具函数 (所有原版逻辑回归)
 # ===========================
 
-def get_china_latency_fast(ip):
-    """极速国测：只测 443 端口，超短超时"""
+def get_config():
+    """读取用户设置的模式"""
+    default = {"mode": "☀️ 正常使用排位"}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f: return json.load(f)
+        except: return default
+    return default
+
+def save_config(mode):
+    """保存模式设置，供后台线程读取"""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"mode": mode}, f)
+
+def generate_cold_ips(count=30):
+    """【回归】冷门 IP 生成器 (避峰模式专用)"""
+    prefixes = ["162.159.36", "162.159.46", "198.41.214", "172.64.198", "103.21.244"]
+    return [f"{random.choice(prefixes)}.{random.randint(1, 254)}" for _ in range(count)]
+
+def get_ip_extended_info(ip):
+    """【回归】查询 ISP 和是否原生 (流媒体模式专用)"""
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country,isp,hosting", timeout=2.0).json()
+        return {
+            "country": r.get("country", "Unk"),
+            "isp": r.get("isp", "Unk"),
+            "is_native": not r.get("hosting", True) # hosting=False 即为原生
+        }
+    except: return {"country": "Unk", "isp": "Unk", "is_native": False}
+
+def get_china_latency(ip):
+    """【保留】中国连通性模拟测试"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.4) # 400ms 极速超时
+        s.settimeout(0.5) # 500ms 超时
         t1 = time.perf_counter()
         s.connect((ip, 443))
         dur = (time.perf_counter() - t1) * 1000
         s.close()
         return int(dur)
-    except:
-        return 999
+    except: return 999
 
 def sync_dns(ip):
-    # 这里保留你的 DNS 同步逻辑，如果未配置 Secrets 则跳过
+    """Cloudflare DNS 同步"""
     try:
-        if "api_token" not in st.secrets: return "未配置 API"
+        if "api_token" not in st.secrets: return "⚠️ 未配置 Secrets"
         cfg = st.secrets
         url = f"https://api.cloudflare.com/client/v4/zones/{cfg['zone_id']}/dns_records"
         headers = {"Authorization": f"Bearer {cfg['api_token']}", "Content-Type": "application/json"}
+        # 获取记录
         recs = requests.get(url, headers=headers, params={"name": cfg['record_name']}, timeout=5).json()
         if recs["result"]:
             rid = recs["result"][0]["id"]
-            if recs["result"][0]["content"] == ip: return "✅ IP未变"
+            current_ip = recs["result"][0]["content"]
+            if current_ip == ip: return f"✅ IP未变 ({ip})"
+            # 更新记录
             requests.put(f"{url}/{rid}", headers=headers, json={"type":"A","name":cfg['record_name'],"content":ip,"ttl":60,"proxied":False})
-            return f"🚀 已更新: {ip}"
-    except: return "⚠️ 同步跳过"
+            return f"🚀 已切换: {current_ip} ➔ {ip}"
+    except Exception as e: return f"❌ API错误: {str(e)[:10]}"
+    return "⚠️ 记录未找到"
 
 # ===========================
-# 3. 后台扫描逻辑
+# 3. 后台智能守护线程 (融合逻辑核心)
 # ===========================
 
-def background_worker_fast():
+def background_manager():
+    """后台管家：根据 Config 模式，智能调度爬虫和测试"""
     while True:
         try:
-            # 1. 快速抓取少量 IP
-            pool_raw = []
+            # A. 读取当前模式
+            cfg = get_config()
+            mode = cfg["mode"]
+            
+            # B. 构建候选池 (融合：历史 + 爬虫 + 冷门)
+            pool = []
+            seen = set()
+            
+            # 1. 本地历史回捞 (Local Data Analysis)
+            if os.path.exists(SAVED_IP_FILE):
+                with open(SAVED_IP_FILE, "r") as f:
+                    hist_ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', f.read())
+                    # 取最后存入的 20 个历史优选
+                    for ip in hist_ips[-20:]:
+                        if ip not in seen:
+                            pool.append({"ip": ip, "type": "history"})
+                            seen.add(ip)
+
+            # 2. 爬虫抓取 (Hot IPs)
             urls = ["https://www.cloudflare.com/ips-v4", "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
+            crawled_ips = []
             for u in urls:
-                try: 
-                    text = requests.get(u, timeout=3).text
-                    pool_raw.extend(re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', text))
+                try:
+                    crawled_ips.extend(re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', requests.get(u, timeout=5).text))
                 except: pass
             
-            # 精简样本：只取 30 个，保证秒出结果
-            final_pool = [{"ip": ip} for ip in random.sample(list(set(pool_raw)), min(len(pool_raw), 30))]
-            
+            # 随机取 30 个热门 IP
+            if crawled_ips:
+                for ip in random.sample(crawled_ips, min(len(crawled_ips), 30)):
+                    if ip not in seen:
+                        pool.append({"ip": ip, "type": "hot"})
+                        seen.add(ip)
+
+            # 3. 模式特供：避峰模式注入冷门 IP
+            if mode == "🌙 晚高峰避峰排位":
+                cold_ips = generate_cold_ips(30)
+                for ip in cold_ips:
+                    if ip not in seen:
+                        pool.append({"ip": ip, "type": "cold"})
+                        seen.add(ip)
+
+            # C. 多线程深度测试
             results = []
-            # 2. 高并发测速
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-                def run_test(node):
+            # 限制并发数为 25，平衡速度与准确性
+            with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
+                def run_full_logic(node):
                     ip = node['ip']
-                    cn_lat = get_china_latency_fast(ip)
-                    if cn_lat > 600: return None
                     
-                    # 极速测速 (200KB)
+                    # 1. 国测 (必须)
+                    cn_lat = get_china_latency(ip)
+                    if cn_lat > 800: return None # 连不通直接丢弃
+
+                    # 2. 模式特判：原生检测 (流媒体模式)
+                    info = {"is_native": False, "isp": "Unk"}
+                    if mode == "🧬 原生IP分数排位":
+                        info = get_ip_extended_info(ip)
+                        # 如果是原生模式但IP非原生，直接大幅扣分或丢弃，这里选择保留但低分
+                    
+                    # 3. 测速 (使用 500KB 小文件平衡速度)
                     speed = 0.0
                     try:
                         st_t = time.perf_counter()
-                        r = requests.get(f"http://{ip}/__down?bytes=200000", headers={"Host": "speed.cloudflare.com"}, timeout=2)
+                        r = requests.get(f"http://{ip}/__down?bytes=500000", headers={"Host": "speed.cloudflare.com"}, timeout=3)
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 评分：延迟越低分越高，速度越快分越高
-                    score = 1000 - cn_lat + (speed * 80)
-                    return {"ip": ip, "score": round(score,1), "cn_lat": cn_lat, "speed": round(speed,2)}
+                    # 4. 动态评分引擎 (核心回归)
+                    score = 100
+                    # 基础分
+                    score -= (cn_lat / 5) 
+                    score += (speed * 20)
+                    
+                    # 模式加成
+                    if mode == "🌙 晚高峰避峰排位":
+                        if node['type'] == "cold": score += 30 # 冷门IP加分
+                        score -= (cn_lat / 2) # 对延迟更敏感
+                        
+                    elif mode == "🧬 原生IP分数排位":
+                        if info['is_native']: score += 500 # 原生IP巨额加分
+                        else: score -= 200
+                        
+                    elif node['type'] == "history":
+                        score += 10 # 历史表现好的微量加分
+                        
+                    return {
+                        "ip": ip, "score": round(score, 1), "cn_lat": cn_lat, 
+                        "speed": round(speed, 2), "type": node['type'], 
+                        "is_native": info.get('is_native', False)
+                    }
 
-                futs = [ex.submit(run_test, n) for n in final_pool]
+                futs = [ex.submit(run_full_logic, n) for n in pool]
                 for f in concurrent.futures.as_completed(futs):
                     res = f.result()
                     if res: results.append(res)
-
+            
+            # D. 结算与保存
             if results:
                 results.sort(key=lambda x: x['score'], reverse=True)
                 winner = results[0]
+                
+                # 1. 将好的 IP 存入本地历史 (Local Data Filter)
+                good_ips = [r['ip'] for r in results if r['score'] > 0]
+                with open(SAVED_IP_FILE, "a") as f: # 追加模式
+                    for ip in good_ips[:3]: # 只存前3名
+                        f.write(f"{ip}\n")
+                
+                # 2. 去重并限制历史文件大小 (防止无限膨胀)
+                # (略：简单的做法是定期清理，这里先保留追加逻辑)
+
+                # 3. 同步 DNS
                 sync_msg = sync_dns(winner['ip'])
                 
-                # 写入 JSON
-                data_to_save = {
-                    "last_run": datetime.now().strftime("%H:%M:%S"),
+                # 4. 写 JSON 给前端
+                save_data = {
+                    "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode_used": mode,
                     "winner": winner,
                     "sync_msg": sync_msg,
-                    "table": results[:20] # 只存前20名
+                    "table": results[:20]
                 }
                 with open(RESULT_FILE, "w") as f:
-                    json.dump(data_to_save, f)
+                    json.dump(save_data, f)
                     
         except Exception as e:
-            print(f"Worker Error: {e}")
+            print(f"Worker Exception: {e}")
         
-        # 每 10 分钟运行一次
-        time.sleep(600)
+        time.sleep(600) # 10分钟循环
 
-# 启动后台
-if "worker_started" not in st.session_state:
+# 启动后台线程
+if "bg_thread" not in st.session_state:
     import threading
-    threading.Thread(target=background_worker_fast, daemon=True).start()
-    st.session_state.worker_started = True
+    t = threading.Thread(target=background_manager, daemon=True)
+    t.start()
+    st.session_state.bg_thread = True
 
 # ===========================
-# 4. 前端可视化展示 (这里是你之前缺失的部分)
+# 4. 前端交互与可视化 (融合)
 # ===========================
-st.title("📊 VLESS 极速数据面板")
+
+# --- Sidebar: 找回控制权 ---
+with st.sidebar:
+    st.header("🎮 控制中心")
+    curr_conf = get_config()
+    
+    # 模式选择回归
+    new_mode = st.radio(
+        "选择排位策略", 
+        ["☀️ 正常使用排位", "🌙 晚高峰避峰排位", "🧬 原生IP分数排位"],
+        index=["☀️ 正常使用排位", "🌙 晚高峰避峰排位", "🧬 原生IP分数排位"].index(curr_conf.get("mode", "☀️ 正常使用排位"))
+    )
+    
+    if new_mode != curr_conf.get("mode"):
+        save_config(new_mode)
+        st.toast(f"策略已切换为 [{new_mode}]，将在下轮后台扫描生效", icon="🔄")
+    
+    st.info("后台线程每 10 分钟自动执行一次。")
+
+# --- Main Dashboard ---
+st.title("🛸 VLESS 全能监控指挥台")
 
 if os.path.exists(RESULT_FILE):
-    # 读取数据
     with open(RESULT_FILE, "r") as f:
         data = json.load(f)
     
     winner = data['winner']
-    all_data = data['table']
-    df = pd.DataFrame(all_data)
-
-    # --- 区域 1: 核心指标卡片 ---
-    st.markdown("### 🏆 当前冠军节点")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("优选 IP", winner['ip'], delta="Live")
-    c2.metric("中国延迟", f"{winner['cn_lat']} ms", delta_color="inverse")
-    c3.metric("下载速度", f"{winner['speed']} MB/s")
-    c4.metric("同步状态", data.get('sync_msg', '未开启'))
-
-    st.divider()
-
-    # --- 区域 2: 数据可视化图表 ---
-    col_chart1, col_chart2 = st.columns(2)
+    df = pd.DataFrame(data['table'])
     
-    with col_chart1:
-        st.subheader("📈 Top 10 得分排行")
-        # 取前10名做柱状图
-        top_10 = df.head(10).set_index("ip")
-        st.bar_chart(top_10['score'], color="#00FF00")
-
-    with col_chart2:
-        st.subheader("🎯 延迟 vs 速度分布")
-        # 散点图：横轴延迟，纵轴速度，点的大小代表得分
-        st.scatter_chart(
-            df,
-            x='cn_lat',
-            y='speed',
-            color='score',
-            size='score',
-            use_container_width=True
-        )
-
+    # 状态栏
+    st.markdown(f"**当前状态**: `{data['mode_used']}` | **更新时间**: `{data['last_run']}`")
+    
+    # 指标卡
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("👑 冠军 IP", winner['ip'])
+    c2.metric("🌏 中国延迟", f"{winner['cn_lat']} ms", delta_color="inverse")
+    c3.metric("⚡ 下载速度", f"{winner['speed']} MB/s")
+    c4.metric("☁️ DNS 状态", data['sync_msg'])
+    
     st.divider()
+    
+    # 可视化图表区
+    col_left, col_right = st.columns(2)
+    
+    with col_left:
+        st.subheader("📊 综合评分 Top 10")
+        if not df.empty:
+            chart_data = df.head(10).set_index("ip")
+            st.bar_chart(chart_data['score'], color="#0074D9")
+    
+    with col_right:
+        st.subheader("🎯 延迟/速度 分布图")
+        if not df.empty:
+            st.scatter_chart(
+                df, x='cn_lat', y='speed', 
+                color='type', size='score', 
+                use_container_width=True
+            )
+            st.caption("💡 提示：点越靠左上角越好 (低延迟+高速度)")
 
-    # --- 区域 3: 详细数据列表 ---
-    st.subheader("📋 详细排位表")
+    # 详细数据表
+    st.subheader("📋 详细扫描报告")
+    
+    # 配置列显示，增加原生标识
+    col_cfg = {
+        "score": st.column_config.ProgressColumn("评分", format="%.1f", min_value=0, max_value=1200),
+        "cn_lat": st.column_config.NumberColumn("CN延迟", format="%d ms"),
+        "speed": st.column_config.NumberColumn("速度", format="%.2f MB/s"),
+        "type": st.column_config.TextColumn("来源"),
+        "is_native": st.column_config.CheckboxColumn("原生解锁?")
+    }
+    
     st.dataframe(
-        df,
-        column_order=("score", "ip", "cn_lat", "speed"),
-        column_config={
-            "score": st.column_config.ProgressColumn(
-                "综合评分",
-                help="基于延迟和速度计算",
-                format="%.1f",
-                min_value=0,
-                max_value=1200,
-            ),
-            "cn_lat": st.column_config.NumberColumn(
-                "国内延迟 (ms)",
-                format="%d ms"
-            ),
-            "speed": st.column_config.NumberColumn(
-                "速度 (MB/s)",
-                format="%.2f MB/s"
-            ),
-            "ip": "IP 地址"
-        },
+        df, 
+        column_order=("score", "ip", "cn_lat", "speed", "type", "is_native"),
+        column_config=col_cfg, 
         use_container_width=True,
         hide_index=True
     )
-    
-    st.caption(f"上次更新时间: {data['last_run']}")
 
 else:
-    # 如果还没有数据文件
-    st.warning("⏳ 后台正在初始化首次数据，请稍等 10-15 秒...")
-    st.progress(0.3, text="正在爬取节点并测速...")
+    st.warning("📡 后台正在初始化数据... 请稍等 10-20 秒")
+    st.info(f"当前模式: {get_config()['mode']}")
+    st.progress(0.4, text="正在混合历史数据与新爬取节点...")
     time.sleep(5)
     st.rerun()
 
-# 自动刷新机制 (仅刷新 UI，不触发重测)
+# 自动刷新 UI (只刷新看数据，不重跑)
 time.sleep(10)
 st.rerun()
