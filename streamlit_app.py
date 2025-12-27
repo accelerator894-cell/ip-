@@ -31,6 +31,7 @@ CONFIG_FILE = "app_config.json"
 QUICK_SEEDS = ["104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1"]
 GOLDEN_SUBNETS = ["104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", "172.64.0.0/13"]
 
+# 文件安全读写工具
 def safe_write_json(path, data):
     tmp = path + ".tmp"
     try:
@@ -47,13 +48,18 @@ def safe_read_json(path, default):
     except: return default
 
 # ===========================
-# 2. 爬虫池管理逻辑 (可视化核心)
+# 2. 爬虫池管理 (垃圾节点补位逻辑)
 # ===========================
 
 class PoolManager:
     @staticmethod
+    def trigger_fill():
+        """同时启动大众爬虫和冷门挖掘"""
+        threading.Thread(target=PoolManager.fill_crawler, daemon=True).start()
+        threading.Thread(target=PoolManager.fill_niche, daemon=True).start()
+
+    @staticmethod
     def fill_crawler():
-        """从 GitHub 爬取大众 IP"""
         ips = safe_read_json(CRAWLER_FILE, [])
         if len(ips) >= 20: return
         try:
@@ -68,7 +74,6 @@ class PoolManager:
 
     @staticmethod
     def fill_niche():
-        """算法生成冷门优质 IP"""
         ips = safe_read_json(NICHE_FILE, [])
         if len(ips) >= 20: return
         new_ips = []
@@ -81,40 +86,43 @@ class PoolManager:
         safe_write_json(NICHE_FILE, ips)
 
 # ===========================
-# 3. 三级跳极速进化引擎
+# 3. 独立线程进化引擎 (1分钟强制检测 + 垃圾即时替换)
 # ===========================
 
 def background_evolution():
     start_time = time.time()
+    last_deep_check = 0 # 记录上一次分钟级深检时间
     db_data = safe_read_json(DB_FILE, {})
     
     while True:
         try:
+            now = time.time()
             cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443})
-            elapsed = time.time() - start_time
             
-            # 目标收集
+            # --- 阶段 A: 扫描垃圾节点 (低于40分判定为垃圾) ---
+            top_20 = sorted(db_data.values(), key=lambda x: x.get('score', 0), reverse=True)[:20]
+            junk_found = any(node.get('score', 0) < 40 for node in top_20)
+            
+            # --- 阶段 B: 补位触发逻辑 ---
+            is_minute_tick = (now - last_deep_check >= 60) # 满一分钟强制检测
+            
+            if junk_found or is_minute_tick or (now - start_time < 15):
+                # 如果有垃圾节点或到达一分钟周期，立刻爬取补位
+                PoolManager.trigger_fill()
+                if is_minute_tick: last_deep_check = now
+            
+            # --- 阶段 C: 组合扫描目标 ---
             targets = [{"ip": ip, "src": "⚡ 本地种子"} for ip in QUICK_SEEDS]
-            
-            # 立即触发爬虫和冷门挖掘 (三级跳动作)
-            threading.Thread(target=PoolManager.fill_crawler).start()
-            threading.Thread(target=PoolManager.fill_niche).start()
-            
             c_ips = safe_read_json(CRAWLER_FILE, [])
             n_ips = safe_read_json(NICHE_FILE, [])
             
-            # 启动数秒后立即将爬虫数据加入测试
-            if elapsed > 3:
-                targets += [{"ip": ip, "src": "🕷️ 爬虫发现"} for ip in c_ips[:8]]
-                targets += [{"ip": ip, "src": "💎 冷门挖掘"} for ip in n_ips[:8]]
-            
-            if elapsed > 8:
-                history = sorted(db_data.values(), key=lambda x: x.get('score', 0), reverse=True)[:10]
-                targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in history]
+            targets += [{"ip": ip, "src": "🕷️ 爬虫补位"} for ip in c_ips[:10]]
+            targets += [{"ip": ip, "src": "💎 冷门挖掘"} for ip in n_ips[:10]]
+            targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in top_20]
 
-            # 极速流水线测试
+            # --- 阶段 D: 极速流水线测试 ---
             current_results = []
-            down_bytes = 15000 if elapsed < 10 else 200000
+            down_bytes = 20000 if (now - start_time < 15) else 200000
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
                 def test_task(t):
@@ -132,49 +140,38 @@ def background_evolution():
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 地理信息可视化标记
-                    geo = {"cc": "UN", "country": "Unknown"}
-                    if elapsed > 10:
-                        try:
-                            g = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,country", timeout=1).json()
-                            geo = {"cc": g.get("countryCode","UN"), "country": g.get("country","Unknown")}
-                        except: pass
-                    else:
-                        geo = {"cc": "CN", "country": "四川电信测速中"}
-
+                    # 评分逻辑：自动执行质量替换
                     score = round(100 - p_avg/5 + min(speed*5, 35), 1)
                     res = {"ip": ip, "score": score, "avg": p_avg, "speed": round(speed, 2), 
-                           "src": t['src'], "cc": geo['cc'], "country": geo['country'], 
-                           "last_test": datetime.now().strftime("%H:%M:%S")}
+                           "src": t['src'], "last_test": datetime.now().strftime("%H:%M:%S")}
                     
+                    # 如果新节点比库里的强，或库里是垃圾节点，则替换
                     if score >= db_data.get(ip, {}).get('score', 0): db_data[ip] = res
                     return res
 
                 unique_ips = {v['ip']:v for v in targets}.values()
                 futs = [ex.submit(test_task, i) for i in unique_ips]
                 
-                # 实时写入可视化结果
-                tested_c, tested_n = [], []
+                tested_ips = []
                 for f in concurrent.futures.as_completed(futs):
                     r = f.result()
                     if r: 
                         current_results.append(r)
-                        if r['src'] == "🕷️ 爬虫发现": tested_c.append(r['ip'])
-                        if r['src'] == "💎 冷门挖掘": tested_n.append(r['ip'])
+                        tested_ips.append(r['ip'])
                         temp_sorted = sorted(current_results, key=lambda x: x['score'], reverse=True)
                         safe_write_json(RESULT_FILE, {
                             "last_run": datetime.now().strftime("%H:%M:%S"), 
-                            "winner": temp_sorted[0], 
-                            "table": temp_sorted,
+                            "winner": temp_sorted[0], "table": temp_sorted,
                             "c_size": len(c_ips), "n_size": len(n_ips)
                         })
-            
-            # 清理已测爬虫 IP
-            safe_write_json(CRAWLER_FILE, [i for i in c_ips if i not in tested_c])
-            safe_write_json(NICHE_FILE, [i for i in n_ips if i not in tested_n])
+
+            # 清理池子
+            safe_write_json(CRAWLER_FILE, [i for i in c_ips if i not in tested_ips])
+            safe_write_json(NICHE_FILE, [i for i in n_ips if i not in tested_ips])
             safe_write_json(DB_FILE, db_data)
             
         except: pass
+        # 即使进入休眠，垃圾检测也会在下一轮秒级响应
         time.sleep(10)
 
 if "evolution_engine" not in st.session_state:
@@ -182,7 +179,7 @@ if "evolution_engine" not in st.session_state:
     st.session_state.evolution_engine = True
 
 # ===========================
-# 4. 前端展示 (找回侧边栏 + 可视化爬虫数据)
+# 4. 前端展示 (找回侧边栏功能)
 # ===========================
 
 with st.sidebar:
@@ -206,29 +203,26 @@ data = safe_read_json(RESULT_FILE, None)
 
 if data:
     w = data['winner']
-    st.markdown(f"### 🏆 当前最强 IP: `{w['ip']}` | 📍 {w['cc']} {w['country']}")
+    st.markdown(f"### 🏆 当前最强 IP: `{w['ip']}`")
     
-    # 可视化爬虫池状态
     c1, c2 = st.columns(2)
-    c1.metric("🕷️ 爬虫池待测数量", f"{data.get('c_size', 0)} / 20")
-    c2.metric("💎 冷门池待测数量", f"{data.get('n_size', 0)} / 20")
+    c1.metric("🕷️ 爬虫补位状态", f"{data.get('c_size', 0)} / 20", help="当检测到垃圾节点时会立即填满")
+    c2.metric("💎 冷门挖掘状态", f"{data.get('n_size', 0)} / 20")
     
     st.divider()
     
-    # 结果表格，包含爬取数据的来源标记
     df = pd.DataFrame(data['table'])
+    # 高亮显示低分垃圾节点 (由于自动替换机制，垃圾节点会迅速消失)
     st.dataframe(
         df[['score', 'src', 'ip', 'avg', 'speed', 'last_test']],
         column_config={
-            "score": st.column_config.ProgressColumn("进化评分", min_value=0, max_value=100),
-            "src": "数据来源标记",
-            "avg": "延迟 ms",
-            "speed": "速度 MB/s"
+            "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=100),
+            "src": "分类标记",
         },
         use_container_width=True, hide_index=True
     )
-    st.caption(f"上次演化更新: {data['last_run']} | 历史数据自动优胜劣汰替换中...")
-    time.sleep(4); st.rerun()
+    st.caption(f"上次全量进化: {data['last_run']} | 每 1 分钟执行强制垃圾清理巡检")
+    time.sleep(5); st.rerun()
 else:
-    st.info("🚀 正在激活三级跳引擎：0-3s 加载种子，3s+ 扫描爬虫数据...")
+    st.info("🚀 正在激活三级跳引擎... 检测到垃圾节点将立即触发补位爬取。")
     time.sleep(2); st.rerun()
