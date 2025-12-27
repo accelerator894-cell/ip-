@@ -3,11 +3,10 @@ import requests
 import threading
 import time
 import urllib.parse
-import base64
 from datetime import datetime
 
 # ==========================================
-# 1. 配置中心 (请填入你的信息)
+# 1. 配置中心
 # ==========================================
 CF_CONFIG = {
     "api_token": "92os9FwyeG7jQDYpD6Rb0Cxrqu5YjtUjGfY1xKBm", 
@@ -15,10 +14,6 @@ CF_CONFIG = {
     "record_name": "speed.milet.qzz.io", 
 }
 
-# 外部订阅地址 (如果暂时没有，代码会使用下方默认的 VLESS_LINKS)
-SUB_URL = "" 
-
-# 初始备用节点列表
 VLESS_LINKS = [
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@162.159.136.0:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@188.114.97.1:443/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp",
@@ -26,127 +21,118 @@ VLESS_LINKS = [
 ]
 
 # ==========================================
-# 2. 核心类逻辑 (封装 API 与 测速)
+# 2. 自动化管理逻辑 (优化版)
 # ==========================================
-class AutoOptimizer:
+class ProOptimizer:
     def __init__(self, config, links):
         self.config = config
         self.links = links
         self.token = str(config.get("api_token", "")).strip()
         self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        self.best_ip = "尚未初始化"
-        self.last_update = "等待中"
+        self.best_ip = "188.114.97.1"
+        self.current_latency = 999
+        self.last_update = datetime.now().strftime("%H:%M:%S")
         self.status_log = []
 
     def log(self, message, type="info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.status_log.append({"time": timestamp, "msg": message, "type": type})
-        if len(self.status_log) > 15: self.status_log.pop(0)
+        if len(self.status_log) > 12: self.status_log.pop(0)
 
-    def fetch_subscription(self):
-        """动态同步订阅节点"""
-        if not SUB_URL: return
-        try:
-            resp = requests.get(SUB_URL, timeout=10)
-            decoded = base64.b64decode(resp.text).decode('utf-8')
-            new_links = [line for line in decoded.split('\n') if line.strip().startswith("vless://")]
-            if new_links:
-                self.links = new_links
-                self.log(f"🌐 订阅已更新，载入 {len(new_links)} 个节点", "success")
-        except:
-            self.log("⚠️ 订阅解析失败，保持原有列表", "error")
+    def get_average_latency(self, ip, count=3):
+        """多次测速取平均值，排除抖动"""
+        latencies = []
+        for _ in range(count):
+            try:
+                start = time.time()
+                # 使用 verify=False 忽略 SSL 证书校验，加快测速速度
+                requests.get(f"https://{ip}", timeout=1.2, verify=False)
+                latencies.append((time.time() - start) * 1000)
+                time.sleep(0.1) # 两次测试间稍作停顿
+            except:
+                continue
+        return int(sum(latencies) / len(latencies)) if latencies else 9999
 
-    def update_cf_dns(self, ip):
-        """同步 IP 到 Cloudflare"""
+    def update_cf_dns(self, new_ip, new_latency):
+        """带有阈值保护的更新逻辑"""
+        # 优化点：如果新 IP 提升不明显 (小于 20ms)，则不更新以保持连接稳定
+        if self.best_ip == new_ip:
+            self.log(f"✅ IP 未变动，当前延迟: {new_latency}ms", "success")
+            return True
+            
+        diff = self.current_latency - new_latency
+        if diff < 20 and self.current_latency != 999:
+            self.log(f"⚖️ 提升仅 {diff}ms (不足20ms)，放弃切换以保持稳定", "info")
+            return True
+
         base_url = "https://api.cloudflare.com/client/v4"
         try:
-            self.log("🛰️ 正在从 Cloudflare 获取记录信息...", "info")
+            self.log(f"🛰️ 提升明显 ({diff}ms)，正在同步 CF...", "info")
             list_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records?name={self.config['record_name']}"
             res = requests.get(list_url, headers=self.headers, timeout=10).json()
             
-            if not res.get("success"):
-                self.log(f"❌ API 报错: {res['errors'][0]['message']}", "error")
-                return False
-
-            record = res["result"][0]
-            if record["content"] == ip:
-                self.log(f"✅ CF 记录已是 {ip}，无需操作", "success")
-                return True
-
-            self.log(f"🛠️ 发现更优 IP，开始同步: {ip}", "info")
-            update_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records/{record['id']}"
-            data = {"type": "A", "name": self.config['record_name'], "content": ip, "ttl": 60, "proxied": False}
-            put_res = requests.put(update_url, headers=self.headers, json=data, timeout=10).json()
-            
-            if put_res.get("success"):
-                self.log("🚀 同步成功！", "success")
-                return True
+            if res.get("success") and res.get("result"):
+                record = res["result"][0]
+                update_url = f"{base_url}/zones/{self.config['zone_id']}/dns_records/{record['id']}"
+                data = {"type": "A", "name": self.config['record_name'], "content": new_ip, "ttl": 60, "proxied": False}
+                put_res = requests.put(update_url, headers=self.headers, json=data, timeout=10).json()
+                
+                if put_res.get("success"):
+                    self.log(f"🚀 同步成功: {new_ip} ({new_latency}ms)", "success")
+                    return True
             return False
         except Exception as e:
-            self.log(f"⚠️ 异常: {str(e)}", "error")
+            self.log(f"⚠️ 更新异常: {str(e)}", "error")
             return False
 
-    def run_forever(self):
-        """自动化巡检主线程"""
+    def run_loop(self):
         while True:
-            self.fetch_subscription()
-            self.log("🔄 开始新一轮自动优选...", "info")
+            self.log("🔄 开启专业级巡检 (多次采样模式)...", "info")
+            ips = list(set([urllib.parse.urlparse(l).netloc.split('@')[-1].split(':')[0] for l in self.links if l.startswith("vless")]))
             
-            # 解析 IP
-            ips = []
-            for link in self.links:
-                try:
-                    p = urllib.parse.urlparse(link)
-                    ips.append(p.netloc.split('@')[-1].split(':')[0])
-                except: continue
-            
-            # 测速
             results = []
-            for ip in set(ips):
-                try:
-                    start = time.time()
-                    requests.get(f"https://{ip}", timeout=1.5, verify=False)
-                    results.append((ip, int((time.time() - start) * 1000)))
-                except: continue
+            for ip in ips:
+                avg_l = self.get_average_latency(ip)
+                if avg_l < 2000:
+                    results.append((ip, avg_l))
             
             if results:
                 results.sort(key=lambda x: x[1])
-                top_ip = results[0][0]
-                self.log(f"🏆 锁定最优 IP: {top_ip} ({results[0][1]}ms)", "info")
-                if self.update_cf_dns(top_ip):
+                top_ip, top_latency = results[0]
+                self.log(f"🏆 筛选完成: {top_ip} (平均 {top_latency}ms)", "info")
+                
+                if self.update_cf_dns(top_ip, top_latency):
                     self.best_ip = top_ip
+                    self.current_latency = top_latency
                     self.last_update = datetime.now().strftime("%H:%M:%S")
             
-            self.log("💤 进入休眠周期 (10分钟)", "info")
             time.sleep(600)
 
 # ==========================================
-# 3. UI 界面层
+# 3. Streamlit UI
 # ==========================================
 def main():
-    st.set_page_config(page_title="CF 自动化管理", layout="centered")
-    st.title("🛡️ 自动优选同步系统 v3.0")
+    st.set_page_config(page_title="CF 优选 Pro", layout="centered")
+    st.title("🛡️ 自动优选同步系统 Pro")
 
-    if 'opt' not in st.session_state:
-        st.session_state.opt = AutoOptimizer(CF_CONFIG, VLESS_LINKS)
-        threading.Thread(target=st.session_state.opt.run_forever, daemon=True).start()
+    if 'pro_opt' not in st.session_state:
+        st.session_state.pro_opt = ProOptimizer(CF_CONFIG, VLESS_LINKS)
+        threading.Thread(target=st.session_state.pro_opt.run_loop, daemon=True).start()
 
-    opt = st.session_state.opt
+    opt = st.session_state.pro_opt
 
-    col1, col2 = st.columns(2)
-    col1.metric("当前生效 IP", opt.best_ip)
-    col2.metric("最后更新", opt.last_update)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("当前 IP", opt.best_ip)
+    c2.metric("平均延迟", f"{opt.current_latency}ms")
+    c3.metric("最后更新", opt.last_update)
 
     st.divider()
-
-    st.subheader("⚙️ 自动化实时日志")
-    log_area = st.container(height=400, border=True)
-    with log_area:
-        for entry in reversed(opt.status_log):
-            msg = f"[{entry['time']}] {entry['msg']}"
-            if entry['type'] == "success": st.success(msg)
-            elif entry['type'] == "error": st.error(msg)
-            else: st.code(msg)
+    st.subheader("⚙️ 智能运行日志")
+    for entry in reversed(opt.status_log):
+        m = f"[{entry['time']}] {entry['msg']}"
+        if entry['type'] == "success": st.success(m)
+        elif entry['type'] == "error": st.error(m)
+        else: st.code(m)
 
     time.sleep(10)
     st.rerun()
