@@ -18,7 +18,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 基础配置与文件 IO
+# 1. 基础配置与文件 IO (确保原子化写入)
 # ===========================
 st.set_page_config(page_title="Cloudflare 猎手进化版", page_icon="🧬", layout="wide")
 
@@ -47,12 +47,13 @@ def safe_read_json(path, default):
     except: return default
 
 # ===========================
-# 2. 爬虫池补位管理 (保留功能)
+# 2. 爬虫补位管理 (保留垃圾清理功能)
 # ===========================
 
 class PoolManager:
     @staticmethod
     def trigger_fill():
+        """检测到垃圾节点或到达周期时触发补位"""
         threading.Thread(target=PoolManager.fill_crawler, daemon=True).start()
         threading.Thread(target=PoolManager.fill_niche, daemon=True).start()
 
@@ -84,7 +85,7 @@ class PoolManager:
         safe_write_json(NICHE_FILE, ips)
 
 # ===========================
-# 3. 独立进化引擎 (三级跳 + 普查 + 自动更换)
+# 3. 独立进化引擎 (三级跳 + 5分钟普查 + 自动更换)
 # ===========================
 
 def background_evolution():
@@ -98,24 +99,23 @@ def background_evolution():
             cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443})
             elapsed = now - start_time
             
-            # --- 阶段 A: 扫描策略判断 ---
-            is_full_scan = (now - last_full_scan >= 300) # 5分钟全量普查
+            # --- 阶段 A: 判断扫描深度 (5分钟一次全量普查) ---
+            is_full_scan = (now - last_full_scan >= 300) 
             
-            # --- 阶段 B: 目标收集 ---
+            # --- 阶段 B: 目标收集 (保留三级跳极速启动) ---
             targets = []
             if is_full_scan:
                 targets += [{"ip": i['ip'], "src": "📂 基因普查"} for i in db_data.values()]
-                targets += [{"ip": ip, "src": "🕷️ 爬虫全检"} for ip in safe_read_json(CRAWLER_FILE, [])]
                 last_full_scan = now
             else:
                 top_20 = sorted(db_data.values(), key=lambda x: x.get('score', 0), reverse=True)[:20]
                 targets += [{"ip": ip, "src": "⚡ 本地种子"} for ip in QUICK_SEEDS]
                 if elapsed > 8: targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in top_20]
-                if elapsed > 3: targets += [{"ip": ip, "src": "🕷️ 爬虫补位"} for ip in safe_read_json(CRAWLER_FILE, [])[:10]]
+                if elapsed > 3: targets += [{"ip": ip, "src": "🕷️ 爬虫发现"} for ip in safe_read_json(CRAWLER_FILE, [])[:10]]
 
-            # --- 阶段 C: 极速流水线测试 ---
+            # --- 阶段 C: 测试并自动更换优胜劣汰 ---
             current_results = []
-            down_bytes = 20000 if elapsed < 10 else 200000
+            down_bytes = 20000 if elapsed < 15 else 200000
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
                 def test_task(t):
@@ -133,6 +133,7 @@ def background_evolution():
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
+                    # 识别国家地区并打标
                     geo = {"cc": "CN", "country": "四川电信测速中"} if elapsed < 15 else {"cc": "UN", "country": "Unknown"}
                     if elapsed >= 15:
                         try:
@@ -145,7 +146,7 @@ def background_evolution():
                            "src": t['src'], "cc": geo['cc'], "country": geo['country'], 
                            "last_test": datetime.now().strftime("%H:%M:%S")}
                     
-                    # 自动更换比当前更好的节点
+                    # 【自动更换】逻辑：如果测试出的分数更高，则更新数据库
                     if score >= db_data.get(ip, {}).get('score', 0): db_data[ip] = res
                     return res
 
@@ -159,7 +160,7 @@ def background_evolution():
                         safe_write_json(RESULT_FILE, {
                             "last_run": datetime.now().strftime("%H:%M:%S"), 
                             "winner": temp_sorted[0], "table": temp_sorted,
-                            "is_full": is_full_scan, "c_size": len(safe_read_json(CRAWLER_FILE, []))
+                            "is_full": is_full_scan
                         })
 
             PoolManager.trigger_fill()
@@ -173,10 +174,10 @@ if "evolution_engine" not in st.session_state:
     st.session_state.evolution_engine = True
 
 # ===========================
-# 4. 前端展示 (复原 UI 细节)
+# 4. 前端渲染 (还原截图 UI)
 # ===========================
 
-# --- 侧边栏 (复原 1000036579.jpg 细节) ---
+# --- 侧边栏 (还原 1000036579.jpg) ---
 with st.sidebar:
     st.markdown("### 🛠️ 配置控制台")
     cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443, "uuid": "", "ws_path": "/"})
@@ -184,7 +185,7 @@ with st.sidebar:
     modes = ["☀️ 正常使用排位", "⚡ 极速低延迟", "🤖 GPT 独享专线", "🎬 流媒体解锁专线"]
     new_mode = st.radio("优选策略", modes, index=modes.index(cfg['mode']) if cfg['mode'] in modes else 0)
     
-    # 复原折叠面板
+    # 还原 VLESS 参数折叠面板
     with st.expander("🔑 VLESS 参数设置"):
         new_uuid = st.text_input("UUID", value=cfg.get("uuid", ""))
         new_host = st.text_input("伪装域名 (Host)", value=cfg.get("host", "speed.cloudflare.com"))
@@ -206,13 +207,13 @@ if data:
     w = data['winner']
     st.title("🧬 Cloudflare 猎手进化版")
     
-    # 状态标记 (复原 1000036593.jpg)
-    scan_tag = "🚀 全量扫描中" if data.get('is_full') else "📡 实时监测中"
+    # 还原状态标记
+    scan_tag = "🚀 全量普查中" if data.get('is_full') else "📡 实时监测中"
     st.markdown(f"### 🏆 当前最强 IP: `{w['ip']}` | 状态: `{scan_tag}`")
     
-    # 冠军卡片 (复原 1000036580.jpg)
+    # 还原冠军指标卡片
     c1, c2, c3 = st.columns(3)
-    c1.metric("进化评分", w['score'])
+    c1.metric("进化得分", w['score'])
     c2.metric("延迟 ms", w['avg'])
     c3.metric("速度 MB/s", w['speed'])
     
@@ -221,16 +222,15 @@ if data:
     st.divider()
     st.subheader(f"🧬 基因库排行 (策略: {data['mode']})")
     
-    # 整理数据表 (复原 1000036590.jpg 字段)
+    # 还原数据表格
     df = pd.DataFrame(data['table'])
     
-    # 转换显示
-    def source_icon(src):
+    def format_src(src):
         if "种子" in src: return "⚡ 本地种子"
         if "历史" in src: return "📂 历史优选"
         return f"🕷️ {src}"
 
-    df['分类来源'] = df['src'].apply(source_icon)
+    df['分类来源'] = df['src'].apply(format_src)
     df['地理位置'] = df['cc'] + " " + df['country']
 
     st.dataframe(
@@ -246,7 +246,7 @@ if data:
     st.caption(f"上次更新: {data['last_run']} | 每 5 分钟全量扫描并自动更换更优节点")
     time.sleep(5); st.rerun()
 else:
-    # 复原启动画面 (1000036586.jpg)
+    # 还原启动信息
     st.title("🧬 Cloudflare 猎手进化版")
     st.info("🚀 正在为您极速连接四川电信骨干网并加载本地基因库... (初次约需 10 秒)")
     time.sleep(2); st.rerun()
