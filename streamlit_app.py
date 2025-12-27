@@ -39,9 +39,9 @@ DEFAULT_CONFIG = {
     "port": 443,
     "uuid": "",
     "ws_path": "/",
-    "max_workers": 20,
-    "connect_timeout": 2.5,
-    "download_timeout": 8.0,
+    "max_workers": 15,
+    "connect_timeout": 3.0,
+    "download_timeout": 10.0,
     "geo_cache_hours": 6,
     "test_bytes_by_mode": {
         "☀️ 正常使用排位": 50_000,
@@ -131,7 +131,7 @@ class IPPoolManager:
         safe_write_json(FILES["blacklist"], list(bl))
 
     @staticmethod
-    def fill_crawler_pool(max_size=80):
+    def fill_crawler_pool(max_size=20):
         current = safe_json(FILES["crawlers"], [])
         if len(current) >= max_size: return
         sources = [
@@ -143,7 +143,7 @@ class IPPoolManager:
         blacklist = IPPoolManager.get_blacklist()
         for url in sources:
             try:
-                r = requests.get(url, timeout=15)
+                r = requests.get(url, timeout=20)
                 ips = re.findall(r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)', r.text)
                 for ip in ips:
                     if ip not in blacklist and ip not in found:
@@ -155,12 +155,12 @@ class IPPoolManager:
         logger.info(f"爬虫池更新: {len(new_list)} 个")
 
     @staticmethod
-    def fill_niche_pool(max_size=80):
+    def fill_niche_pool(max_size=20):
         current = safe_json(FILES["niches"], [])
         if len(current) >= max_size: return
         blacklist = IPPoolManager.get_blacklist()
         new_ips = []
-        for _ in range(max_size * 12):
+        for _ in range(max_size * 5):
             try:
                 net = ipaddress.ip_network(random.choice(GOLDEN_SUBNETS))
                 candidate = str(net.network_address + random.randint(1, net.num_addresses - 3))
@@ -177,7 +177,7 @@ def evolution_engine():
     db = safe_json(FILES["database"])
     fail_counts = defaultdict(int, safe_json(FILES["fail_count"]))
 
-    logger.info("启动快速扫描种子IP...")
+    logger.info("启动快速扫描 + 补位到10...")
 
     first_round_done = False
     min_nodes = 10
@@ -191,11 +191,17 @@ def evolution_engine():
             targets = []
             targets.extend({"ip": ip, "src": "⚡ 优质种子"} for ip in QUICK_SEEDS)
 
-            # 如果第一轮完成，且节点少于10个，继续补位
+            # 第一轮完成后，如果节点不足10个，强制补位
             if first_round_done and len(db) < min_nodes:
                 if db:
                     sorted_db = sorted(db.items(), key=lambda x: x[1].get('score', 0), reverse=True)
                     targets.extend({"ip": ip, "src": "🏆 历史优选"} for ip, _ in sorted_db)
+                # 额外随机生成一些新IP补位
+                for _ in range(20):
+                    net = ipaddress.ip_network(random.choice(GOLDEN_SUBNETS))
+                    candidate = str(net.network_address + random.randint(1, net.num_addresses - 3))
+                    if candidate not in db:
+                        targets.append({"ip": candidate, "src": "💎 补位随机"})
 
             if first_round_done:
                 targets.extend({"ip": ip, "src": "🕷️ 爬虫"} for ip in safe_json(FILES["crawlers"], []))
@@ -291,13 +297,13 @@ def evolution_engine():
 
                 if not first_round_done:
                     first_round_done = True
-                    logger.info("第一轮种子扫描完成，开始补位")
+                    logger.info("第一轮完成，开始补位到10")
 
-            # 补位逻辑
+            # 补位提示
             if len(db) < 10:
                 logger.info(f"有效节点 {len(db)} 个，继续补位...")
 
-            if random.random() < 0.7:
+            if random.random() < 0.5:
                 threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
                 threading.Thread(target=IPPoolManager.fill_niche_pool).start()
 
@@ -308,7 +314,7 @@ def evolution_engine():
             logger.error(f"引擎异常: {e}")
             time.sleep(10)
 
-        time.sleep(6)
+        time.sleep(8)
 
 if "started" not in st.session_state:
     threading.Thread(target=evolution_engine, daemon=True).start()
@@ -326,7 +332,7 @@ with st.sidebar:
     with st.expander("高级设置"):
         host = st.text_input("伪装域名", value=cfg["host"])
         port = st.number_input("端口", value=cfg["port"])
-        max_workers = st.slider("最大并发", 5, 40, cfg["max_workers"], step=5)
+        max_workers = st.slider("最大并发", 5, 30, cfg["max_workers"], step=5)
 
     if st.button("保存并重启", type="primary"):
         new_cfg = cfg.copy()
@@ -342,7 +348,7 @@ data = safe_json(FILES["results"])
 
 if not data or not data.get("winner"):
     st.title("🧬 Cloudflare 猎手 · 进化版")
-    st.info("引擎启动中... 预计5~15秒初次扫描完成")
+    st.info("引擎启动中... 预计5~15秒初次扫描完成，正在补位到10...")
     time.sleep(3)
     st.rerun()
 
@@ -392,6 +398,6 @@ else:
         hide_index=True
     )
 
-    st.caption(f"最后更新: {data['last_run']}　｜　每6秒刷新一次")
-    time.sleep(6)
+    st.caption(f"最后更新: {data['last_run']}　｜　每8秒刷新一次")
+    time.sleep(8)
     st.rerun()
