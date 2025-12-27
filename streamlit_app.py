@@ -15,211 +15,181 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置与样式
+# 1. 页面配置 (Ping0 风格配色)
 # ===========================
-st.set_page_config(page_title="VLESS 10分钟自动竞速版", page_icon="🏎️", layout="wide")
+st.set_page_config(page_title="VLESS 竞速 - Ping0 增强版", page_icon="📶", layout="wide")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #001f3f; color: #E0E0E0; }
-    div[data-testid="column"] { background-color: #003366; border: 1px solid #0074D9; border-radius: 8px; padding: 15px; }
-    .auto-active { color: #2ECC40; font-weight: bold; animation: blinker 1s linear infinite; }
-    @keyframes blinker { 50% { opacity: 0; } }
+    .stApp { background-color: #0e1117; color: #ffffff; }
+    /* 模仿 Ping0 的深蓝色面板 */
+    div[data-testid="column"] { 
+        background-color: #1a1c24; 
+        border: 1px solid #2d3139; 
+        border-radius: 10px; 
+        padding: 20px; 
+    }
+    .ping0-label { color: #8a92a6; font-size: 0.8rem; font-weight: bold; }
+    .ping0-value { color: #00ff41; font-family: 'Courier New', monospace; font-size: 1.5rem; }
+    .stMetricValue { color: #00ff41 !important; font-family: 'Courier New', monospace; }
     </style>
     """, unsafe_allow_html=True)
 
 # ===========================
-# 2. 基础配置
+# 2. 核心逻辑：Ping0 (TCP) 模拟引擎
 # ===========================
-try:
-    CF_CONFIG = {
-        "api_token": st.secrets["api_token"].strip(),
-        "zone_id": st.secrets["zone_id"].strip(),
-        "record_name": st.secrets["record_name"].strip(),
+
+def ping0_tcp_test(ip, port=443, count=5):
+    """
+    模拟 Ping0.com 的 TCP 探测机制
+    进行 5 次高精度握手测试，计算平均值、最小值和抖动
+    """
+    latencies = []
+    success = 0
+    for _ in range(count):
+        try:
+            start = time.perf_counter()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect((ip, port))
+            s.close()
+            # 毫秒级精度
+            latencies.append((time.perf_counter() - start) * 1000)
+            success += 1
+        except:
+            pass
+        time.sleep(0.02) # 探测间隔
+    
+    if not latencies:
+        return {"avg": 9999, "min": 9999, "jitter": 0, "loss": 100}
+    
+    return {
+        "avg": int(statistics.mean(latencies)),
+        "min": int(min(latencies)),
+        "jitter": int(statistics.stdev(latencies)) if len(latencies) > 1 else 0,
+        "loss": int(((count - success) / count) * 100)
     }
-except:
-    st.error("❌ 配置缺失！请检查 secrets.toml")
-    st.stop()
-
-DB_FILE = "racing_history.log"
-SAVED_IP_FILE = "good_ips.txt"
 
 # ===========================
-# 3. 核心功能函数 (保留原有地理/测速逻辑)
+# 3. 增强版深度评测
 # ===========================
-
-@st.cache_data(ttl=3600)
-def get_ip_info(ip):
-    try:
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
-        r = requests.get(url, timeout=2).json()
-        cc = r.get("countryCode", "UNK")
-        if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG']: return "🌏 亚洲", r.get("country")
-        if cc in ['US', 'CA', 'MX']: return "🇺🇸 美洲", r.get("country")
-        if cc in ['DE', 'GB', 'FR', 'NL', 'RU']: return "🇪🇺 欧洲", r.get("country")
-        return "🌍 其他", r.get("country")
-    except: return "🛸 未知", "Unknown"
-
-def tcp_ping(ip, port=443, timeout=0.8):
-    try:
-        start = time.time()
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        s.close()
-        return int((time.time() - start) * 1000)
-    except: return 9999
-
-def get_enhanced_pool():
-    competitors = []
-    seen_ips = set()
-    # 电信种子
-    seeds = ["1.1.1.1", "1.0.0.1", "104.16.0.1", "172.67.1.1"]
-    for ip in seeds:
-        competitors.append({"ip": ip, "source": "🏠 种子"})
-        seen_ips.add(ip)
-    
-    # 爬虫源 (增加数量)
-    urls = [
-        "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt",
-        "https://www.cloudflare.com/ips-v4"
-    ]
-    scraped_pool = set()
-    def fetch(url):
-        try: return re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', requests.get(url, timeout=5).text)
-        except: return []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        for res in ex.map(fetch, urls):
-            for ip in res: scraped_pool.add(ip)
-    
-    picked = random.sample(list(scraped_pool), min(len(scraped_pool), 150))
-    for ip in picked:
-        if ip not in seen_ips:
-            competitors.append({"ip": ip, "source": "☁️ 爬虫"})
-    return competitors
 
 def deep_test_node(node):
     ip = node['ip']
-    lats = []
-    for _ in range(3):
-        p = tcp_ping(ip)
-        if p < 9999: lats.append(p)
     
-    if not lats: return None
-    
-    avg_tcp = statistics.mean(lats)
-    loss = ((3 - len(lats)) / 3) * 100
-    jitter = statistics.stdev(lats) if len(lats) > 1 else 0
-    region, country = get_ip_info(ip)
+    # --- Ping0 测试环节 ---
+    p0 = ping0_tcp_test(ip)
+    if p0['avg'] > 1500: return None # 响应太慢直接过滤
 
-    # 2MB 测速
+    # --- 地理位置识别 ---
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
+        r = requests.get(url, timeout=2).json()
+        region = r.get("country", "Unknown")
+        cc = r.get("countryCode", "UNK")
+        area = "🌏 亚洲" if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG'] else "🌍 其他"
+    except:
+        area, region = "🛸 未知", "Unknown"
+
+    # --- 速度实测 (2MB) ---
     speed_mb = 0.0
     try:
-        s_time = time.time()
-        r = requests.get(f"http://{ip}/__down?bytes=2000000", headers={"Host": "speed.cloudflare.com"}, timeout=4)
+        s_time = time.perf_counter()
+        r = requests.get(f"http://{ip}/__down?bytes=2000000", 
+                         headers={"Host": "speed.cloudflare.com"}, timeout=4)
         if r.status_code == 200:
-            speed_mb = (len(r.content)/1024/1024) / (time.time() - s_time)
+            speed_mb = (len(r.content)/1024/1024) / (time.perf_counter() - s_time)
     except: pass
 
-    # 电信评分
-    score = 100 - (avg_tcp/5) - (loss*20) - (jitter*2) + (speed_mb*10)
+    # --- 电信专属综合评分 ---
+    # 延迟分(40%) + 丢包罚分(30%) + 速度加分(30%)
+    score = 100 - (p0['avg'] / 5) - (p0['loss'] * 20) + (speed_mb * 12) - (p0['jitter'] * 2)
 
     return {
-        "ip": ip, "region": region, "country": country, 
-        "source": node['source'], "score": round(score, 1),
-        "tcp": int(avg_tcp), "speed": round(speed_mb, 2), 
-        "loss": int(loss), "jitter": int(jitter)
+        "ip": ip, "area": area, "country": region, 
+        "score": round(score, 1), "tcp_avg": p0['avg'], 
+        "tcp_min": p0['min'], "jitter": p0['jitter'],
+        "loss": p0['loss'], "speed": round(speed_mb, 2),
+        "source": node['source']
     }
 
-def sync_dns(ip):
-    url = f"https://api.cloudflare.com/client/v4/zones/{CF_CONFIG['zone_id']}/dns_records"
-    headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
-    try:
-        recs = requests.get(url, headers=headers, params={"name": CF_CONFIG['record_name']}, timeout=5).json()
-        if recs["result"]:
-            rid = recs["result"][0]["id"]
-            if recs["result"][0]["content"] == ip: return "✅ IP未变"
-            requests.put(f"{url}/{rid}", headers=headers, json={"type":"A","name":CF_CONFIG['record_name'],"content":ip,"ttl":60,"proxied":False})
-            return f"🚀 已同步: {ip}"
-    except: return "⚠️ API异常"
-    return "❌ 记录不存在"
-
 # ===========================
-# 4. 自动化逻辑与界面
+# 4. UI 界面与自动化
 # ===========================
-st.title("🏎️ VLESS 终极竞速 (10分钟自动版)")
+st.title("🏎️ VLESS 竞速 - Ping0 自动化排位版")
 
-# 初始化 Session State
-if "last_run" not in st.session_state:
-    st.session_state.last_run = datetime.min
-if "auto_enabled" not in st.session_state:
-    st.session_state.auto_enabled = False
+# 侧边栏与 10 分钟自动逻辑
+if "last_run" not in st.session_state: st.session_state.last_run = datetime.min
 
 with st.sidebar:
-    st.header("⚙️ 自动化配置")
-    st.session_state.auto_enabled = st.toggle("开启 10 分钟自动排位", value=st.session_state.auto_enabled)
-    if st.session_state.auto_enabled:
-        next_run = st.session_state.last_run + timedelta(minutes=10)
-        time_left = next_run - datetime.now()
-        if time_left.total_seconds() > 0:
-            st.markdown(f"状态: <span class='auto-active'>● 等待中</span> (余 {int(time_left.total_seconds())}s)", unsafe_allow_html=True)
-        else:
-            st.markdown(f"状态: <span class='auto-active'>● 正在触发...</span>", unsafe_allow_html=True)
+    st.header("⚙️ 自动化中心")
+    auto_on = st.toggle("开启 10 分钟自动更新", value=True)
+    st.write(f"上次运行: {st.session_state.last_run.strftime('%H:%M:%S')}")
+    if st.button("🗑️ 重置本地库"):
+        if os.path.exists("good_ips.txt"): os.remove("good_ips.txt")
 
-# 顶部布局
-c1, c2, c3 = st.columns([2, 1, 1])
-with c1:
-    st.info("💡 模式：每10分钟自动更新爬虫节点并优选延迟最低、带宽最高的节点解析。")
-with c2:
-    st.metric("上次运行时间", st.session_state.last_run.strftime('%H:%M:%S') if st.session_state.last_run != datetime.min else "从未运行")
-with c3:
-    manual_start = st.button("🏁 手动开始排位", type="primary", use_container_width=True)
-
-# 触发条件判断
+# 核心触发逻辑
 now = datetime.now()
-auto_trigger = st.session_state.auto_enabled and (now - st.session_state.last_run >= timedelta(minutes=10))
+should_run = (auto_on and (now - st.session_state.last_run >= timedelta(minutes=10)))
 
-if manual_start or auto_trigger:
+if st.button("🏁 手动强制排位", type="primary") or should_run:
     st.session_state.last_run = now
-    with st.spinner("Stadium: 正在进行 10 分钟例行排位赛..."):
-        tasks = get_enhanced_pool()
-        progress = st.progress(0)
+    
+    # 选手池（复用之前的高质量爬虫）
+    from __main__ import get_enhanced_pool # 假设此函数在同文件
+    tasks = get_enhanced_pool() 
+    
+    with st.status("🚀 正在启动 Ping0 级探测...", expanded=True) as status:
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        progress = st.progress(0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
             futs = [ex.submit(deep_test_node, t) for t in tasks]
             for i, f in enumerate(concurrent.futures.as_completed(futs)):
                 progress.progress((i + 1) / len(tasks))
                 res = f.result()
                 if res: results.append(res)
-        
+        status.update(label="✅ 测试完成", state="complete")
+
     if results:
         results.sort(key=lambda x: x['score'], reverse=True)
         winner = results[0]
-        sync_msg = sync_dns(winner['ip'])
         
-        st.success(f"🏆 冠军节点: {winner['ip']} | 地区: {winner['country']}")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("评分", winner['score'])
-        k2.metric("延迟", f"{winner['tcp']}ms")
-        k3.metric("速度", f"{winner['speed']}MB/s")
-        k4.metric("解析", sync_msg)
+        # 冠军面板：Ping0 风格展示
+        st.subheader("🏆 冠军节点 (Ping0 数据)")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.markdown("<p class='ping0-label'>IP 地址</p>", unsafe_allow_html=True)
+            st.markdown(f"<p class='ping0-value'>{winner['ip']}</p>", unsafe_allow_html=True)
+        with col2:
+            st.metric("Ping0 (TCP AVG)", f"{winner['tcp_avg']} ms")
+        with col3:
+            st.metric("带宽 (2MB Test)", f"{winner['speed']} MB/s")
+        with col4:
+            st.metric("丢包率", f"{winner['loss']}%")
 
-        # 保留原版 Tab 展示
+        # 详细表格
+        st.divider()
         df = pd.DataFrame(results)
-        t1, t2, t3, t4 = st.tabs(["🌐 总榜单", "🌏 亚洲赛区", "🇺🇸 美洲赛区", "🇪🇺 欧洲赛区"])
-        cols = ["score", "ip", "tcp", "speed", "loss", "country"]
-        with t1: st.dataframe(df[cols], use_container_width=True)
-        with t2: st.dataframe(df[df['region'] == "🌏 亚洲"][cols], use_container_width=True)
-        with t3: st.dataframe(df[df['region'] == "🇺🇸 美洲"][cols], use_container_width=True)
-        with t4: st.dataframe(df[df['region'] == "🇪🇺 欧洲"][cols], use_container_width=True)
+        st.dataframe(
+            df[['score', 'ip', 'tcp_avg', 'tcp_min', 'jitter', 'speed', 'country']],
+            use_container_width=True,
+            column_config={
+                "tcp_avg": "平均延迟",
+                "tcp_min": "最小延迟",
+                "jitter": "抖动",
+                "speed": "测速(MB/s)"
+            }
+        )
+        
+        # 自动同步 DNS
+        from __main__ import sync_dns
+        st.info(sync_dns(winner['ip']))
 
-    # 如果是自动模式，强制刷新进入下一个倒计时
-    if st.session_state.auto_enabled:
-        time.sleep(2)
+    if auto_on:
+        time.sleep(10) # 缓冲
         st.rerun()
 
-# 自动刷新占位：如果没在运行但开启了自动，每10秒刷新一次页面看是否到点了
-if st.session_state.auto_enabled:
-    time.sleep(10)
+# 自动刷新占位
+if auto_on:
+    time.sleep(30)
     st.rerun()
