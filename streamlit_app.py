@@ -55,12 +55,14 @@ GOLDEN_SUBNETS = [
     "104.16.0.0/12", "104.28.0.0/16", "104.21.0.0/16",
     "172.64.0.0/13", "172.67.0.0/16", "162.158.0.0/15",
     "173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20",
+    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",  # 亚洲补充
 ]
 
 QUICK_SEEDS = [
     "104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1",
     "104.18.20.126", "172.64.155.1", "104.16.123.96", "172.67.69.1",
-    "104.17.0.1", "172.65.1.1", "104.20.1.1", "172.68.1.1"
+    "104.17.0.1", "172.65.1.1", "104.20.1.1", "172.68.1.1",
+    "2a09:bac6:d69c:15f::23:4668"  # 新加坡 IPv6 节点（你 ping0.cc 查的）
 ]
 
 geo_cache = {}
@@ -177,22 +179,27 @@ def evolution_engine():
     db = safe_json(FILES["database"])
     fail_counts = defaultdict(int, safe_json(FILES["fail_count"]))
 
+    # 启动时自动填充池子一次
+    IPPoolManager.fill_crawler_pool()
+    IPPoolManager.fill_niche_pool()
+
     while True:
         try:
             cfg = safe_json(FILES["config"], DEFAULT_CONFIG.copy())
             now = time.time()
             is_full_scan = (now - time.time() % 300) < 10
 
-            # 每轮强制填充
-            threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
-            threading.Thread(target=IPPoolManager.fill_niche_pool).start()
+            # 每轮强制尝试填充
+            if random.random() < 0.8:
+                threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
+                threading.Thread(target=IPPoolManager.fill_niche_pool).start()
 
             targets = []
             if is_full_scan:
                 targets.extend({"ip": ip, "src": "📂 全量扫描"} for ip in db)
             else:
                 targets.extend({"ip": ip, "src": "⚡ 优质种子"} for ip in QUICK_SEEDS)
-                top = sorted(db.items(), key=lambda x: x[1].get('score', 0), reverse=True)[:60]
+                top = sorted(db.items(), key=lambda x: x[1].get('score', 0), reverse=True)[:80]
                 targets.extend({"ip": ip, "src": "🏆 历史优秀"} for ip, _ in top)
                 targets.extend({"ip": ip, "src": "🕷️ 爬虫"} for ip in safe_json(FILES["crawlers"], []))
                 targets.extend({"ip": ip, "src": "💎 冷门"} for ip in safe_json(FILES["niches"], []))
@@ -265,7 +272,7 @@ def evolution_engine():
                             IPPoolManager.add_to_blacklist(ip)
                         return None
 
-                futures = [executor.submit(test_ip, t) for t in unique_targets[:400]]
+                futures = [executor.submit(test_ip, t) for t in unique_targets[:500]]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res:
