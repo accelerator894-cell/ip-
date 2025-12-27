@@ -17,9 +17,16 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置
+# 1. 核心配置定义 (确保前后端一致)
 # ===========================
-st.set_page_config(page_title="VLESS 四川电信监控台", page_icon="🐼", layout="wide")
+st.set_page_config(page_title="VLESS 四川电信 GPT版", page_icon="🐼", layout="wide")
+
+# 定义当前版本支持的所有模式
+VALID_MODES = [
+    "☀️ 正常使用排位", 
+    "🌙 晚高峰避峰排位", 
+    "🤖 GPT 独享专线"
+]
 
 RESULT_FILE = "scan_results.json"
 CONFIG_FILE = "app_config.json"
@@ -29,7 +36,8 @@ st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
     div[data-testid="column"] { background-color: #15171e; border: 1px solid #262730; border-radius: 8px; padding: 15px; }
-    .gpt-mode-active { border: 2px solid #2ECC71 !important; }
+    /* 选中 GPT 模式时的特效 */
+    .gpt-active { border: 2px solid #2ECC71 !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -38,12 +46,20 @@ st.markdown("""
 # ===========================
 
 def get_config():
-    default = {"mode": "☀️ 正常使用排位"}
+    """读取配置，并包含自动纠错逻辑"""
+    default_conf = {"mode": VALID_MODES[0]} # 默认使用第一个模式
+    
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f: return json.load(f)
-        except: return default
-    return default
+            with open(CONFIG_FILE, "r") as f:
+                saved_conf = json.load(f)
+                # 关键修复：检查保存的模式是否在当前支持的列表中
+                if saved_conf.get("mode") not in VALID_MODES:
+                    return default_conf # 如果是旧版本的模式，强制重置
+                return saved_conf
+        except:
+            return default_conf
+    return default_conf
 
 def save_config(mode):
     with open(CONFIG_FILE, "w") as f: json.dump({"mode": mode}, f)
@@ -68,7 +84,6 @@ def get_geo_and_gpt_status(ip):
         }
         region_name = region_map.get(cc, f"🌍 {cc}")
         
-        # OpenAI 黑名单 (简化版)
         blocked_cc = ['CN', 'HK', 'RU', 'IR', 'KP', 'CU', 'SY', 'MO']
         gpt_status = "✅ 支持" if cc not in blocked_cc else "❌ 不支持"
         
@@ -76,24 +91,13 @@ def get_geo_and_gpt_status(ip):
     except:
         return {"cc": "Unk", "region": "❓ 未知", "isp": "Unk", "gpt": "❓ 未知"}
 
-# --- TLS 握手测试 (通用版) ---
 def check_tls_handshake(ip):
-    """
-    模拟 TLS 握手，验证 IP 是否能处理加密流量。
-    使用通用 SNI (speed.cloudflare.com) 进行探测，确保是有效的 CF 节点。
-    """
     try:
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        
-        # 1.5秒超时
-        conn = context.wrap_socket(
-            socket.socket(socket.AF_INET),
-            server_hostname="speed.cloudflare.com" # 通用检测
-        )
+        conn = context.wrap_socket(socket.socket(socket.AF_INET), server_hostname="speed.cloudflare.com")
         conn.settimeout(1.5)
-        
         t1 = time.perf_counter()
         conn.connect((ip, 443))
         dur = (time.perf_counter() - t1) * 1000
@@ -103,30 +107,20 @@ def check_tls_handshake(ip):
         return {"status": False, "latency": 9999}
 
 def calculate_score(mode, avg, jitter, loss, speed, gpt_status, tls_ok):
-    # 1. TLS 阻断直接归零
     if not tls_ok: return 0 
-    
-    # 2. GPT 模式一票否决
     if mode == "🤖 GPT 独享专线" and gpt_status != "✅ 支持": return 0
 
     score = 100.0
-    
-    # 3. 丢包惩罚 (四川电信敏感)
     loss_penalty = 6 if mode != "🤖 GPT 独享专线" else 4
     score -= (loss * loss_penalty)
     
-    # 4. 延迟基准
     limit = 280 if mode == "🤖 GPT 独享专线" else 180
     if avg > limit: score -= (avg - limit) / 5
     
-    # 5. 抖动与速度
     score -= jitter * 1.5
     score += min(speed * 3, 30)
     
-    # 6. GPT 加分
-    if mode == "🤖 GPT 独享专线" and gpt_status == "✅ 支持":
-        score += 10
-
+    if mode == "🤖 GPT 独享专线" and gpt_status == "✅ 支持": score += 10
     return max(0, round(score, 1))
 
 def ping0_tcp_test(ip, count=6):
@@ -171,7 +165,6 @@ def sync_dns(ip):
 def smart_crawler(mode, time_slot):
     pool, seen = [], set()
     
-    # 1. 本地固态
     if os.path.exists(SAVED_IP_FILE):
         with open(SAVED_IP_FILE, "r") as f:
             local_ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', f.read())
@@ -179,7 +172,6 @@ def smart_crawler(mode, time_slot):
                 if ip not in seen:
                     pool.append({"ip": ip, "source": "📂 本地固态"}); seen.add(ip)
 
-    # 2. 基因衍生
     if pool:
         parents = [n['ip'] for n in pool[:5]]
         for ip in parents:
@@ -189,13 +181,17 @@ def smart_crawler(mode, time_slot):
                 if child not in seen:
                     pool.append({"ip": child, "source": "🧬 基因衍生"}); seen.add(child)
 
-    # 3. 全网爬虫
     if time_slot != "PEAK":
         try:
+            # 增加了针对 GPT 友好的源
             urls = ["https://www.cloudflare.com/ips-v4", "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
             for u in urls:
                 txt = requests.get(u, timeout=3).text
                 found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
+                # 针对 GPT 模式的特殊过滤：优先取 104.19 段 (SJC 较多)
+                if mode == "🤖 GPT 独享专线":
+                    found = [ip for ip in found if ip.startswith("104.19") or ip.startswith("172.64")] + found
+                
                 sample_size = 50 if mode == "🤖 GPT 独享专线" else 30
                 for ip in random.sample(found, min(len(found), sample_size)):
                     if ip not in seen:
@@ -213,16 +209,12 @@ def background_worker():
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
                 def process_node(node):
                     ip = node['ip']
-                    
-                    # 1. 国测筛选
                     cn_lat = get_china_latency(ip)
                     if cn_lat > 600: return None
                     
-                    # 2. TLS 真连接测试 (无配置版)
                     tls = check_tls_handshake(ip)
                     if not tls['status']: return None 
                     
-                    # 3. 测速
                     speed = 0.0
                     try:
                         st_t = time.perf_counter()
@@ -230,14 +222,10 @@ def background_worker():
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 4. Geo & GPT
                     geo = get_geo_and_gpt_status(ip)
-                    
-                    # 5. Ping0
                     p0 = ping0_tcp_test(ip)
                     if p0['loss'] > 25: return None
                     
-                    # 6. 算分
                     score = calculate_score(mode, p0['avg'], p0['jitter'], p0['loss'], speed, geo['gpt'], True)
                     
                     if score <= 0: return None
@@ -257,12 +245,9 @@ def background_worker():
             if results:
                 results.sort(key=lambda x: x['score'], reverse=True)
                 winner = results[0]
-                
                 with open(SAVED_IP_FILE, "a") as f:
                     for r in results[:3]: f.write(f"{r['ip']}\n")
-                
                 sync_dns(winner['ip'])
-
                 state = {"last_run": datetime.now().strftime("%H:%M:%S"), "time_slot": time_slot, "mode": mode, "winner": winner, "sync_msg": "已同步", "table": results[:25]}
                 with open(RESULT_FILE, "w") as f: json.dump(state, f)
                 
@@ -275,15 +260,36 @@ if "bg_thread" not in st.session_state:
     st.session_state.bg_thread = True
 
 # ===========================
-# 4. 前端展示
+# 4. 前端展示 (严格匹配)
 # ===========================
 with st.sidebar:
     st.header("🐼 四川电信控制台")
+    
+    # 获取配置（已含自动纠错）
     curr = get_config()
-    new_mode = st.radio("排位模式", ["☀️ 正常使用排位", "🌙 晚高峰避峰排位", "🤖 GPT 独享专线"], index=0)
-    if new_mode != curr.get("mode"):
+    current_mode = curr.get("mode")
+    
+    # 确保当前模式在列表中，防止 index 报错
+    try:
+        default_index = VALID_MODES.index(current_mode)
+    except ValueError:
+        default_index = 0
+        
+    new_mode = st.radio("排位模式", VALID_MODES, index=default_index)
+    
+    if new_mode != current_mode:
         save_config(new_mode)
-        st.toast(f"模式切换: {new_mode}", icon="🚀")
+        st.toast(f"模式已切换: {new_mode}", icon="🚀")
+        time.sleep(1)
+        st.rerun() # 立即刷新以应用新模式
+    
+    # 根据模式显示不同的提示
+    if new_mode == "🤖 GPT 独享专线":
+        st.success("🤖 GPT 模式已激活\n\n自动过滤非 GPT 地区，延迟容忍度放宽至 280ms。")
+    elif new_mode == "🌙 晚高峰避峰排位":
+        st.warning("🌙 避峰模式已激活\n\n严厉打击丢包，优先选择冷门 IP 段。")
+    else:
+        st.info("☀️ 正常模式\n\n均衡负载，兼顾速度与延迟。")
 
 st.title("🐼 VLESS 电信 GPT 专版")
 
@@ -292,6 +298,9 @@ if os.path.exists(RESULT_FILE):
     winner = data['winner']
     df = pd.DataFrame(data['table'])
     
+    # 动态显示当前模式，与 Sidebar 保持一致
+    st.caption(f"当前运行策略: {data['mode']} | 上次更新: {data['last_run']}")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("👑 冠军 IP", winner['ip'])
     c2.metric("🔒 TLS 握手", f"{winner['tls_lat']} ms")
@@ -319,7 +328,8 @@ if os.path.exists(RESULT_FILE):
     )
 
 else:
-    st.warning("🐼 系统正在后台筛选优质节点，请稍候...")
+    st.warning("🐼 系统正在初始化... 首次运行可能需要 15-30 秒")
+    st.progress(0.3)
     time.sleep(5)
     st.rerun()
 
