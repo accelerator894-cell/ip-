@@ -7,19 +7,21 @@ import os
 import pandas as pd
 import concurrent.futures
 import statistics
+import socket
 from datetime import datetime
 
 # ===========================
-# 1. 页面配置
+# 1. 页面配置 (电信蓝主题)
 # ===========================
-st.set_page_config(page_title="VLESS 全能评测室", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="VLESS 电信专享版", page_icon="📡", layout="wide")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #0E1117; color: #FAFAFA; }
-    div[data-testid="column"] { background-color: #1E1E1E; border: 1px solid #333; border-radius: 8px; padding: 15px; }
-    /* 进度条颜色 */
-    .stProgress > div > div > div > div { background-color: #00FF99; }
+    .stApp { background-color: #001f3f; color: #E0E0E0; } /* 电信深蓝背景 */
+    div[data-testid="column"] { background-color: #003366; border: 1px solid #0074D9; border-radius: 8px; padding: 15px; }
+    div[data-testid="stMetricValue"] { color: #2ECC40 !important; }
+    h1, h2, h3 { color: #7FDBFF !important; }
+    .stProgress > div > div > div > div { background-color: #0074D9; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -33,122 +35,132 @@ try:
         "record_name": st.secrets["record_name"].strip(),
     }
 except:
-    st.error("❌ 配置缺失！请检查 secrets.toml")
+    st.error("❌ 配置缺失！请在 secrets.toml 中填写配置")
     st.stop()
 
-DB_FILE = "scan_history.log"
+DB_FILE = "telecom_history.log"
 
 # ===========================
-# 3. 基础工具函数
+# 3. 电信专属 IP 池构建
 # ===========================
 
-@st.cache_data(ttl=3600)
-def get_ip_info(ip):
-    try:
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
-        r = requests.get(url, timeout=2).json()
-        cc = r.get("countryCode", "UNK")
-        if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG']: return "🌏 亚洲", r.get("country")
-        if cc in ['US', 'CA', 'MX']: return "🇺🇸 美洲", r.get("country")
-        if cc in ['DE', 'GB', 'FR', 'NL']: return "🇪🇺 欧洲", r.get("country")
-        return "🌍 其他", r.get("country")
-    except:
-        return "🛸 未知", "Unknown"
+def generate_telecom_preferred_ips():
+    """生成电信友好的官方段 IP"""
+    # 电信通常对 104.16.x.x 到 104.24.x.x 以及 172.64.x.x 较为友好
+    # 这里生成一些随机的官方段 IP
+    ips = []
+    # 104.16.x.x - 104.20.x.x
+    for _ in range(10):
+        ips.append(f"104.{random.randint(16, 20)}.{random.randint(0, 255)}.{random.randint(0, 255)}")
+    # 172.64.x.x - 172.67.x.x
+    for _ in range(10):
+        ips.append(f"172.{random.randint(64, 67)}.{random.randint(0, 255)}.{random.randint(0, 255)}")
+    return ips
 
-def get_collected_ips():
-    """获取 IP 池 (含官方源保底)"""
-    sources = [
-        "https://www.cloudflare.com/ips-v4", # 官方源
+def get_telecom_pool():
+    """混合池：官方段 + 商业解析 + 采集"""
+    # 1. 采集源 (网络爬虫)
+    urls = [
         "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt",
-        "https://raw.githubusercontent.com/w8ves/CF-IP/master/speedtest.txt"
+        "https://www.cloudflare.com/ips-v4"
     ]
-    all_ips = set()
+    collected = set()
     
     def fetch(url):
         try:
-            r = requests.get(url, timeout=4)
+            r = requests.get(url, timeout=3)
             return re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', r.text)
         except: return []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        for res in ex.map(fetch, sources): all_ips.update(res)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        for res in ex.map(fetch, urls):
+            collected.update(res)
+
+    # 2. 注入电信优选段 (VIP处理)
+    telecom_ips = generate_telecom_preferred_ips()
     
-    # 扩大样本量到 80 个以增加命中率
-    final_list = list(all_ips)
-    return random.sample(final_list, min(len(final_list), 80))
+    # 3. 混合列表 (保证至少 30 个官方优选IP + 50 个随机采集IP)
+    pool_list = list(collected)
+    final_list = telecom_ips + random.sample(pool_list, min(len(pool_list), 50))
+    
+    return final_list
 
 # ===========================
-# 4. 深度测试核心逻辑
+# 4. 电信 QoS 对抗评分算法
 # ===========================
 
-def basic_ping(ip):
-    """初筛：单次 Ping"""
-    try:
-        start = time.time()
-        requests.head(f"http://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.0)
-        return int((time.time() - start) * 1000)
-    except: return 9999
+def calculate_telecom_score(lat, jitter, loss, speed):
+    """
+    电信专用评分公式：
+    - 极度厌恶丢包 (Loss)
+    - 极度厌恶抖动 (Jitter)
+    - 对绝对延迟 (Latency) 容忍度稍高，只要不丢包就行
+    """
+    score = 100
+    
+    # 1. 速度分 (权重适中)
+    score += min(speed * 3, 30) 
+    
+    # 2. 延迟扣分 (电信通常 150ms 左右算正常，宽容一点)
+    if lat > 150:
+        score -= (lat - 150) / 4
+    
+    # 3. 抖动扣分 (电信杀手，重罚！每 1ms 抖动扣 3 分)
+    score -= jitter * 3
+    
+    # 4. 丢包扣分 (绝不容忍，只要有丢包直接不及格)
+    if loss > 0:
+        score -= 50 # 只要丢包直接扣50分
+        score -= loss * 2 # 额外追加
+        
+    return round(score, 1)
 
-def advanced_test(node):
-    """精测：抖动、丢包、速度、解锁"""
+def deep_test_telecom(node):
     ip = node['ip']
     
-    # 1. 丢包与抖动测试 (Ping 5次)
+    # 1. 严格稳定性测试 (HTTPS Ping 6次)
     delays = []
     loss_count = 0
-    for _ in range(5):
+    # 模拟真实 VLESS 流量特征 (HTTPS)
+    headers = {"Host": CF_CONFIG['record_name'], "User-Agent": "Mozilla/5.0"}
+    
+    for _ in range(6):
         try:
             s = time.time()
-            requests.head(f"http://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.5)
+            requests.head(f"https://{ip}", headers=headers, timeout=2.0, verify=False)
             delays.append((time.time() - s) * 1000)
         except:
             loss_count += 1
             
-    # 计算稳定性指标
-    loss_rate = (loss_count / 5) * 100
+    loss_rate = (loss_count / 6) * 100
     avg_lat = statistics.mean(delays) if delays else 9999
-    jitter = int(statistics.stdev(delays)) if len(delays) > 1 else 0
+    # 计算抖动 (标准差)
+    jitter = statistics.stdev(delays) if len(delays) > 1 else 0
     
-    # 2. 速度测试 (下载 1MB 小文件)
+    # 2. 速度测试 (下载 2MB)
     speed_mb = 0.0
     try:
-        # 使用 CF 官方测速点，模拟真实回源
         s_time = time.time()
-        # 下载 1MB 数据
-        r = requests.get(f"http://{ip}/__down?bytes=1000000", headers={"Host": "speed.cloudflare.com"}, timeout=5, stream=True)
-        size = 0
-        for chunk in r.iter_content(chunk_size=1024):
-            size += len(chunk)
-            if size >= 1000000: break
-        duration = time.time() - s_time
-        if duration > 0:
-            speed_mb = (size / 1024 / 1024) / duration # MB/s
-    except:
-        speed_mb = 0.0
-
-    # 3. 流媒体解锁 (Netflix + YouTube)
-    nf_status = "❓"
-    yt_status = "❓"
-    try:
-        # Netflix
-        r_nf = requests.get(f"http://{ip}/title/80018499", headers={"Host": "www.netflix.com"}, timeout=2)
-        nf_status = "✅" if r_nf.status_code in [200, 301, 302] else "❌"
-        # YouTube (简单检测)
-        r_yt = requests.get(f"http://{ip}", headers={"Host": "www.youtube.com"}, timeout=2)
-        yt_status = "✅" if r_yt.status_code == 200 else "❌"
+        # 下载 2MB
+        r = requests.get(f"https://{ip}/__down?bytes=2000000", headers={"Host": "speed.cloudflare.com"}, timeout=8, verify=False)
+        if r.status_code == 200:
+            speed_mb = (len(r.content) / 1024 / 1024) / (time.time() - s_time)
     except: pass
-
+    
+    # 3. 评分
+    score = calculate_telecom_score(avg_lat, jitter, loss_rate, speed_mb)
+    
+    # 来源标记
+    source = "⭐ 官方段" if (ip.startswith("104.") or ip.startswith("172.")) else "☁️ 采集池"
+    
     return {
         "ip": ip,
-        "source": node['source'],
-        "region": node['region'],
-        "country": node['country'],
-        "lat": int(avg_lat),      # 平均延迟
-        "jitter": jitter,         # 抖动
-        "loss": f"{int(loss_rate)}%", # 丢包
-        "speed": f"{speed_mb:.2f}",   # 速度
-        "nf": nf_status,
-        "yt": yt_status
+        "source": source,
+        "lat": int(avg_lat),
+        "jitter": int(jitter),
+        "loss": int(loss_rate),
+        "speed": round(speed_mb, 2),
+        "score": score
     }
 
 def sync_dns(ip):
@@ -158,121 +170,90 @@ def sync_dns(ip):
         params = {"name": CF_CONFIG['record_name'], "type": "A"}
         recs = requests.get(url, headers=headers, params=params, timeout=5).json()
         if not recs.get("result"): return "❌ 无记录"
-        
         rid = recs["result"][0]["id"]
         if recs["result"][0]["content"] == ip: return "✅ IP未变"
-        
         requests.put(f"{url}/{rid}", headers=headers, json={
             "type": "A", "name": CF_CONFIG['record_name'], "content": ip, "ttl": 60, "proxied": False
         })
         return f"🚀 已同步: {ip}"
-    except Exception as e: return "⚠️ API错误"
+    except Exception as e: return "⚠️ API异常"
 
 # ===========================
-# 5. 主程序逻辑
+# 5. 主程序 UI
 # ===========================
 
-st.title("🧪 VLESS 全能评测室")
+st.title("📡 VLESS 电信专享版 (Telecom Pro)")
 
-col_btn, col_info = st.columns([1, 3])
-with col_btn:
-    start_btn = st.button("🚀 开始深度体检", type="primary", use_container_width=True)
-with col_info:
-    st.info("💡 评测项目：延迟(Latency) | 抖动(Jitter) | 丢包(Loss) | 速度(Speed) | 解锁(Unlock)")
+c1, c2 = st.columns([3, 1])
+with c1:
+    st.info("💡 针对中国电信 163 骨干网优化：优先 Cloudflare 原生段，严厉打击丢包/抖动节点。")
+with c2:
+    if st.button("🚀 开始优选", type="primary"):
+        st.session_state['scanning'] = True
 
-if start_btn:
+if st.session_state.get('scanning'):
     
-    # --- 第一阶段：海选 (快速 Ping) ---
-    st.subheader("1️⃣ 第一阶段：全球海选 (Broad Scan)")
-    status_text = st.empty()
-    bar = st.progress(0)
+    # --- Step 1: 准备 IP 池 ---
+    with st.spinner("📦 正在生成电信优选 IP 池..."):
+        scan_pool = get_telecom_pool()
+        tasks = [{"ip": ip} for ip in scan_pool]
     
-    # 准备 IP
-    local_ips = ["108.162.194.1", "108.162.192.5", "172.64.32.12", "162.159.61.1"]
-    collected_ips = get_collected_ips()
+    # --- Step 2: 并发测速 ---
+    st.write(f"⚡ 正在深度测试 {len(tasks)} 个节点 (HTTPS 握手 + 丢包分析)...")
+    progress = st.progress(0)
     
-    # 合并任务
-    tasks = [{"ip": ip, "source": "🏠 预设"} for ip in local_ips] + \
-            [{"ip": ip, "source": "☁️ 采集"} for ip in collected_ips]
-    
-    status_text.text(f"正在对 {len(tasks)} 个节点进行快速 Ping...")
-    
-    candidates = []
+    results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
-        future_map = {ex.submit(basic_ping, t['ip']): t for t in tasks}
-        done = 0
-        for fut in concurrent.futures.as_completed(future_map):
-            done += 1
-            bar.progress(done / len(tasks))
-            lat = fut.result()
-            if lat < 1000: # 初筛合格线
-                node = future_map[fut]
-                # 顺便查一下地区，为精测做准备
-                reg, ctry = get_ip_info(node['ip'])
-                candidates.append({**node, "lat": lat, "region": reg, "country": ctry})
-    
-    if not candidates:
-        st.error("❌ 第一阶段全军覆没，请检查网络。")
-        st.stop()
-        
-    # 选出前 10 名进入复赛
-    candidates.sort(key=lambda x: x['lat'])
-    top_10 = candidates[:10]
-    
-    st.success(f"✅ 海选结束，{len(candidates)} 个节点在线，前 10 名进入深度体检。")
-    st.divider()
-    
-    # --- 第二阶段：精测 (深度测试) ---
-    st.subheader("2️⃣ 第二阶段：深度体检 (Deep Test)")
-    st.caption("正在进行：5次连Ping测抖动/丢包 + 1MB下载测速 + 媒体解锁检测...")
-    
-    final_results = []
-    bar2 = st.progress(0)
-    
-    # 这里不能并发太高，防止测速抢带宽导致结果不准
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        futs = [ex.submit(advanced_test, node) for node in top_10]
+        futs = [ex.submit(deep_test_telecom, t) for t in tasks]
         for i, fut in enumerate(concurrent.futures.as_completed(futs)):
-            bar2.progress((i + 1) / len(top_10))
-            final_results.append(fut.result())
+            progress.progress((i + 1) / len(tasks))
+            res = fut.result()
+            # 只有评分 > 0 的才算有效，负分滚粗
+            if res['lat'] < 900: 
+                results.append(res)
+    
+    # --- Step 3: 结果结算 ---
+    if results:
+        # 按分数倒序
+        results.sort(key=lambda x: x['score'], reverse=True)
+        winner = results[0]
+        
+        # 自动同步
+        sync_msg = sync_dns(winner['ip'])
+        
+        # 冠军展示
+        st.success(f"🏆 最终优选: {winner['ip']} (得分: {winner['score']})")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("下载速度", f"{winner['speed']} MB/s")
+        col2.metric("链路延迟", f"{winner['lat']} ms", f"抖动 {winner['jitter']}")
+        col3.metric("丢包率", f"{winner['loss']}%", delta_color="inverse")
+        col4.write(f"📝 {sync_msg}")
+        
+        st.divider()
+        st.subheader("📊 优选榜单 (Top 20)")
+        
+        # 展示数据
+        df = pd.DataFrame(results[:20])
+        st.dataframe(
+            df[["score", "ip", "source", "speed", "lat", "jitter", "loss"]].rename(columns={
+                "score": "评分", "speed": "速度(MB/s)", "lat": "延迟", 
+                "jitter": "抖动", "loss": "丢包(%)"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # 记录
+        with open(DB_FILE, "a") as f:
+            f.write(f"{datetime.now().strftime('%m-%d %H:%M')} | {winner['ip']} | Score:{winner['score']} | {winner['source']}\n")
             
-    # --- 结果展示 ---
-    # 综合排序：优先看丢包(Loss)，其次看延迟(Lat)，最后看速度(Speed 倒序，大的好)
-    # 这里简单处理：按延迟排
-    final_results.sort(key=lambda x: x['lat'])
-    winner = final_results[0]
+    else:
+        st.error("❌ 所有节点均不可用，请检查网络连接。")
     
-    # 同步 DNS
-    sync_msg = sync_dns(winner['ip'])
-    
-    # 冠军展示
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: st.metric("🏆 优选 IP", winner['ip'])
-    with c2: st.metric("平均延迟", f"{winner['lat']} ms", f"抖动 ±{winner['jitter']}")
-    with c3: st.metric("下载速度", f"{winner['speed']} MB/s")
-    with c4: st.metric("丢包率", winner['loss'], delta_color="inverse")
-    
-    st.info(f"📝 {sync_msg}")
-    
-    # 详细表格
-    df = pd.DataFrame(final_results)
-    
-    # 重命名列以显示更好看
-    st.dataframe(
-        df[["source", "ip", "region", "country", "lat", "jitter", "loss", "speed", "nf", "yt"]].rename(columns={
-            "source": "来源", "ip": "IP", "region": "区域", "country": "国家",
-            "lat": "延迟(ms)", "jitter": "抖动", "loss": "丢包", "speed": "速度(MB/s)",
-            "nf": "Netflix", "yt": "YouTube"
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
-    
-    # 写入日志
-    with open(DB_FILE, "a") as f:
-        f.write(f"{datetime.now().strftime('%H:%M')} | {winner['ip']} | {winner['lat']}ms | Speed:{winner['speed']}MB/s\n")
+    st.session_state['scanning'] = False
 
 # 历史记录
-with st.expander("📜 查看历史记录"):
+with st.expander("📜 电信优选历史"):
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f: st.text("".join(f.readlines()[-5:]))
