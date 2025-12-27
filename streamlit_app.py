@@ -16,18 +16,20 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置
+# 1. 页面配置与四川电信UI风格
 # ===========================
-st.set_page_config(page_title="VLESS 全球指挥官 (Ping0版)", page_icon="🗺️", layout="wide")
+st.set_page_config(page_title="VLESS 四川电信定制版", page_icon="🐼", layout="wide")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
     div[data-testid="column"] { background-color: #15171e; border: 1px solid #262730; border-radius: 8px; padding: 15px; }
-    /* 地区标签颜色 */
-    .region-asia { color: #00CC96; font-weight: bold; }
-    .region-us { color: #636EFA; font-weight: bold; }
-    .region-eu { color: #AB63FA; font-weight: bold; }
+    
+    /* 标签颜色定义 */
+    .tag-local { background-color: #2E86C1; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; }
+    .tag-spider { background-color: #C0392B; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; }
+    .tag-gpt-ok { color: #2ECC71; font-weight: bold; }
+    .tag-gpt-no { color: #E74C3C; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -52,75 +54,78 @@ def save_config(mode):
 
 def get_time_slot():
     h = datetime.now().hour
-    if 19 <= h <= 23: return "PEAK"
-    if 1 <= h <= 6:   return "IDLE"
+    if 19 <= h <= 23: return "PEAK"  # 晚高峰
+    if 1 <= h <= 6:   return "IDLE"  # 闲时
     return "NORMAL"
 
-# --- 新增：地缘分类算法 ---
-def get_region_info(ip):
+# --- GPT 与 地区检测 ---
+def get_geo_and_gpt_status(ip):
     """
-    根据 IP 获取国家代码，并归类为 美/亚/欧
+    检测 IP 归属地，并判断是否支持 GPT
     """
     try:
-        # 使用 ip-api.com (注意频率限制，实际生产可换离线库)
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode,isp,hosting"
+        # 使用 ip-api (注意: 生产环境建议用离线库如 GeoIP2)
+        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country,isp,hosting"
         r = requests.get(url, timeout=2).json()
         cc = r.get("countryCode", "US")
+        isp = r.get("isp", "")
         
-        # 归类逻辑
-        asia = ['CN','HK','JP','SG','KR','TW','MY','TH','VN','ID','IN','PH']
-        americas = ['US','CA','MX','BR','AR','CL']
-        europe = ['GB','DE','FR','NL','IT','ES','RU','UA','PL','SE']
-        
-        region = "🌍 其他"
-        if cc in asia: region = "🌏 亚太"
-        elif cc in americas: region = "🗽 美洲"
-        elif cc in europe: region = "🏰 欧洲"
-        
-        return {
-            "region": region,
-            "cc": cc,
-            "is_native": not r.get("hosting", True)
+        # 1. 区域判定
+        region_map = {
+            'CN': '🇨🇳 中国', 'HK': '🇭🇰 香港', 'MO': '🇲🇴 澳门',
+            'US': '🇺🇸 美国', 'JP': '🇯🇵 日本', 'SG': '🇸🇬 新加坡',
+            'KR': '🇰🇷 韩国', 'TW': '🇹🇼 台湾', 'GB': '🇬🇧 英国',
+            'DE': '🇩🇪 德国', 'FR': '🇫🇷 法国'
         }
-    except:
-        return {"region": "🗽 美洲", "cc": "US", "is_native": False} # 默认兜底
+        region_name = region_map.get(cc, f"🌍 {cc}")
 
-# --- 新增：Ping0 评分算法 ---
-def calculate_ping0_score(avg, jitter, loss, speed):
+        # 2. GPT 资格审查 (基于 OpenAI 的地区政策)
+        # OpenAI 不支持: CN, HK, RU, IR, KP 等
+        blocked_cc = ['CN', 'HK', 'RU', 'IR', 'KP', 'CU', 'SY']
+        gpt_status = "✅ 支持"
+        if cc in blocked_cc:
+            gpt_status = "❌ 不支持"
+        
+        return {"cc": cc, "region": region_name, "isp": isp, "gpt": gpt_status}
+    except:
+        return {"cc": "Unk", "region": "❓ 未知", "isp": "Unk", "gpt": "❓ 未知"}
+
+# --- 四川电信定制评分算法 ---
+def calculate_telecom_score(mode, avg, jitter, loss, speed, gpt_status):
     """
-    【Ping0.cc 核心算法复刻】
-    满分 100。
-    1. 丢包 (Loss): 毁灭性打击。丢包 > 0 即大幅扣分。
-    2. 抖动 (Jitter): 稳定性指标。抖动大说明线路拥塞。
-    3. 延迟 (Latency): 基础分，只要不超时都还好。
+    【四川电信专用评分公式】
+    特点：对延迟基准线要求更高(180ms)，极大惩罚丢包
     """
     score = 100.0
     
-    # 1. 丢包扣分 (最严厉)
-    # Ping0 逻辑：有丢包基本就不能用。每 1% 丢包扣 5 分。
-    score -= (loss * 5)
+    # 1. 丢包惩罚 (电信晚高峰最怕这个)
+    # 只要有丢包，分数直接打骨折
+    score -= (loss * 6) 
     
-    # 2. 抖动扣分
-    # 抖动超过 5ms 开始明显扣分，每 1ms 抖动扣 0.5 分
-    if jitter > 5:
-        score -= (jitter - 5) * 0.5
+    # 2. 延迟评分 (基准线 180ms - 典型电信直连美西延迟)
+    if avg > 180:
+        score -= (avg - 180) / 5  # 超过180ms，每10ms扣2分
     
-    # 3. 延迟扣分 (非线性)
-    # 200ms 以内不扣分，超过 200ms 每增加 10ms 扣 1 分
-    if avg > 200:
-        score -= (avg - 200) / 10
+    # 3. 抖动评分
+    score -= jitter * 1.5
+    
+    # 4. 速度加成
+    score += min(speed * 3, 30) # 上限加30分
+    
+    # 5. GPT 加权
+    if gpt_status == "✅ 支持":
+        score += 10 # GPT 节点额外加分
+    else:
+        score -= 20 # 不支持 GPT 的扣分 (既然你要测 GPT)
         
-    # 4. 速度加成 (额外奖励)
-    # 速度仅作为锦上添花，不直接决定 Ping0 分数，但为了综合排名，我们按权重加回
-    # 限制加分上限，防止速度掩盖丢包问题
-    speed_bonus = min(speed * 2, 20) # 最多加20分
-    
-    score += speed_bonus
+    # 模式修正
+    if mode == "🌙 晚高峰避峰排位":
+        score -= loss * 5 # 避峰模式下，丢包扣分加倍
     
     return max(0, round(score, 1))
 
 def ping0_tcp_test(ip, count=6):
-    """TCP 握手测试 (次数增加到6次以获取更准的丢包率)"""
+    """TCP 握手 (Ping0 算法)"""
     lats = []
     success = 0
     for _ in range(count):
@@ -144,7 +149,8 @@ def ping0_tcp_test(ip, count=6):
     return {"avg": int(avg), "jitter": int(jitter), "loss": int(loss)}
 
 def get_china_latency(ip):
-    """模拟国测"""
+    """模拟本地(四川电信)连通性"""
+    # 实际上就是测运行此代码的机器(你的电脑)到 IP 的延迟
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.5)
@@ -171,54 +177,57 @@ def sync_dns(ip):
     return "⚠️ 记录丢失"
 
 # ===========================
-# 3. 智能爬虫与后台调度
+# 3. 智能爬虫与分类调度
 # ===========================
 
 def smart_crawler(mode, time_slot):
-    """智能爬虫 (保留遗传算法)"""
     pool = []
     seen = set()
     
-    # 1. 历史优选回捞
-    history_ips = []
+    # 1. 📂 本地固态 (Local) - 优先级最高
     if os.path.exists(SAVED_IP_FILE):
         with open(SAVED_IP_FILE, "r") as f:
-            history_ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', f.read())
-            for ip in history_ips[-15:]:
+            local_ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', f.read())
+            # 取最新的 15 个本地优选
+            for ip in local_ips[-15:]:
                 if ip not in seen:
-                    pool.append({"ip": ip, "type": "🏆 传家宝"})
+                    pool.append({"ip": ip, "source": "📂 本地固态"}) # 明确标识
                     seen.add(ip)
 
-    # 2. 基因衍生 (遗传算法)
-    if history_ips:
-        parents = history_ips[-5:]
+    # 2. 🧬 基因衍生 (Genetic)
+    if pool:
+        # 基于本地最好的IP，生成邻居段
+        parents = [n['ip'] for n in pool[:5]]
         for ip in parents:
             subnet = ".".join(ip.split(".")[:3])
-            for _ in range(3): # 每个优选 IP 衍生 3 个邻居
+            for _ in range(3):
                 child = f"{subnet}.{random.randint(1, 254)}"
                 if child not in seen:
-                    pool.append({"ip": child, "type": "🧬 衍生"})
+                    pool.append({"ip": child, "source": "🧬 基因衍生"}) # 明确标识
                     seen.add(child)
 
-    # 3. 外部源补充
+    # 3. 🕷️ 全网爬虫 (Crawler)
     if time_slot != "PEAK":
         try:
-            u = "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"
-            txt = requests.get(u, timeout=3).text
-            found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
-            for ip in random.sample(found, min(len(found), 25)):
-                if ip not in seen:
-                    pool.append({"ip": ip, "type": "🔥 热搜"})
-                    seen.add(ip)
+            # 增加一些对电信友好的 Cloudflare 段 (如 104.16..., 172.64...)
+            urls = ["https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
+            for u in urls:
+                txt = requests.get(u, timeout=3).text
+                found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
+                # 随机取 30 个
+                for ip in random.sample(found, min(len(found), 30)):
+                    if ip not in seen:
+                        pool.append({"ip": ip, "source": "🕷️ 全网爬虫"}) # 明确标识
+                        seen.add(ip)
         except: pass
 
-    # 4. 避峰冷门段
+    # 4. 🌙 避峰冷门
     if time_slot == "PEAK" or mode == "🌙 晚高峰避峰排位":
         cold_prefixes = ["162.159.36", "162.159.46", "198.41.214"]
         for _ in range(25):
             ip = f"{random.choice(cold_prefixes)}.{random.randint(1, 254)}"
             if ip not in seen:
-                pool.append({"ip": ip, "type": "🌙 冷门"})
+                pool.append({"ip": ip, "source": "🌙 避峰冷门"})
                 seen.add(ip)
                 
     return pool
@@ -236,18 +245,16 @@ def background_worker():
                 def process_node(node):
                     ip = node['ip']
                     
-                    # 1. 国测筛选
+                    # 1. 基础连通性 (电信本地)
                     cn_lat = get_china_latency(ip)
-                    if cn_lat > 800: return None
+                    if cn_lat > 600: return None
                     
-                    # 2. Ping0 深度测试
+                    # 2. 深度 Ping0 测试
                     p0 = ping0_tcp_test(ip)
-                    if p0['loss'] > 30: return None # 丢包严重直接丢弃
+                    # 电信对丢包极敏感，超过 20% 直接丢弃
+                    if p0['loss'] > 20: return None 
                     
-                    # 3. 获取地理位置 (新增)
-                    geo = get_region_info(ip)
-                    
-                    # 4. 测速
+                    # 3. 测速
                     speed = 0.0
                     try:
                         st_t = time.perf_counter()
@@ -255,34 +262,30 @@ def background_worker():
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 5. Ping0 评分计算
-                    score = calculate_ping0_score(p0['avg'], p0['jitter'], p0['loss'], speed)
+                    # 4. GPT 与 地区检测
+                    geo = get_geo_and_gpt_status(ip)
                     
-                    # 模式加成修正
-                    final_score = score
-                    if mode == "🌙 晚高峰避峰排位":
-                        final_score -= p0['loss'] * 2 # 避峰更怕丢包
-                    elif mode == "🧬 原生IP分数排位":
-                        if geo['is_native']: final_score += 20
-                        else: final_score -= 50
+                    # 5. 算分 (电信定制版)
+                    score = calculate_telecom_score(mode, p0['avg'], p0['jitter'], p0['loss'], speed, geo['gpt'])
                     
                     return {
-                        "ip": ip, "score": final_score, "cn_lat": cn_lat, "speed": round(speed, 2),
-                        "loss": p0['loss'], "jitter": p0['jitter'], "avg": p0['avg'],
-                        "type": node['type'], "region": geo['region'], "cc": geo['cc']
+                        "ip": ip, "score": score, "cn_lat": cn_lat, "speed": round(speed, 2),
+                        "loss": p0['loss'], "jitter": p0['jitter'], 
+                        "source": node['source'], # 核心：保留来源标识
+                        "region": geo['region'], "gpt": geo['gpt']
                     }
 
                 futs = [ex.submit(process_node, n) for n in pool]
                 for f in concurrent.futures.as_completed(futs):
                     res = f.result()
-                    if res and res['score'] > 40: # 只保留及格的
+                    if res and res['score'] > 30: # 稍微放宽一点门槛
                         results.append(res)
 
             if results:
                 results.sort(key=lambda x: x['score'], reverse=True)
                 winner = results[0]
                 
-                # 存入历史库
+                # 写入本地库 (供下次循环作为"本地固态"使用)
                 with open(SAVED_IP_FILE, "a") as f:
                     for r in results[:3]: f.write(f"{r['ip']}\n")
                 
@@ -299,7 +302,7 @@ def background_worker():
                 with open(RESULT_FILE, "w") as f: json.dump(state, f)
                 
         except Exception as e: print(f"Worker Error: {e}")
-        time.sleep(600) # 10分钟
+        time.sleep(600)
 
 if "bg_thread" not in st.session_state:
     import threading
@@ -307,17 +310,19 @@ if "bg_thread" not in st.session_state:
     st.session_state.bg_thread = True
 
 # ===========================
-# 4. 前端可视化
+# 4. 前端可视化 (四川电信定制UI)
 # ===========================
 with st.sidebar:
-    st.header("🎮 控制台")
+    st.header("🐼 四川电信控制台")
     curr = get_config()
-    new_mode = st.radio("模式", ["☀️ 正常使用排位", "🌙 晚高峰避峰排位", "🧬 原生IP分数排位"], index=0)
+    new_mode = st.radio("排位模式", ["☀️ 正常使用排位", "🌙 晚高峰避峰排位", "🧬 原生IP分数排位"], index=0)
     if new_mode != curr.get("mode"):
         save_config(new_mode)
         st.toast(f"已切换: {new_mode}", icon="🔄")
+    
+    st.info("💡 提示：'本地固态' IP 来自你历史筛选的优质节点，'全网爬虫' 来自 GitHub 等源。")
 
-st.title("🗺️ VLESS 全球指挥官 (Ping0版)")
+st.title("🐼 VLESS 电信 GPT 专版")
 
 if os.path.exists(RESULT_FILE):
     with open(RESULT_FILE, "r") as f: data = json.load(f)
@@ -327,51 +332,50 @@ if os.path.exists(RESULT_FILE):
     # 顶部状态
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("👑 冠军 IP", winner['ip'])
-    c2.metric("🌏 归属地", f"{winner['region']} ({winner['cc']})")
-    c3.metric("📈 Ping0 得分", f"{winner['score']}", delta="及格线: 60")
-    c4.metric("💔 丢包率", f"{winner['loss']}%", delta_color="inverse")
+    c2.metric("🌏 归属/GPT", f"{winner['region']} | {winner['gpt']}")
+    c3.metric("📉 电信延迟", f"{winner['cn_lat']} ms", delta=f"-{winner['loss']}% 丢包")
+    c4.metric("📊 综合得分", f"{winner['score']}")
     
     st.divider()
     
-    # 分区域展示
-    tabs = st.tabs(["🌏 亚太 (Asia)", "🗽 美洲 (Americas)", "🏰 欧洲 (Europe)", "📊 全球总览"])
-    
-    def show_region_table(region_name):
-        # 筛选逻辑
-        if region_name == "Global":
-            sub_df = df
-        else:
-            sub_df = df[df['region'].str.contains(region_name)]
-            
-        if sub_df.empty:
-            st.info(f"暂无 {region_name} 区域的优质节点")
-        else:
-            st.dataframe(
-                sub_df,
-                column_order=("score", "ip", "region", "cn_lat", "loss", "jitter", "speed", "type"),
-                column_config={
-                    "score": st.column_config.ProgressColumn("Ping0 评分", format="%.0f", min_value=0, max_value=100),
-                    "region": st.column_config.TextColumn("区域"),
-                    "loss": st.column_config.NumberColumn("丢包%", format="%d%%"),
-                    "jitter": st.column_config.NumberColumn("抖动", format="%d ms"),
-                    "cn_lat": st.column_config.NumberColumn("CN延迟", format="%d ms"),
-                    "speed": st.column_config.NumberColumn("速度", format="%.2f MB/s"),
-                },
-                use_container_width=True,
-                hide_index=True
-            )
+    # 分类图表
+    st.subheader("🧬 IP 来源质量对比")
+    # 使用 Altair 图表区分颜色
+    st.scatter_chart(
+        df, 
+        x='cn_lat', 
+        y='score', 
+        color='source', # 👈 这里通过颜色区分是 本地 还是 爬虫
+        size='speed',
+        use_container_width=True
+    )
+    st.caption("👈 左上角为最佳区域 (低延迟 + 高分)")
 
-    with tabs[0]: show_region_table("亚太")
-    with tabs[1]: show_region_table("美洲")
-    with tabs[2]: show_region_table("欧洲")
-    with tabs[3]:
-        # 全球总览加一个散点图
-        st.subheader("🌐 全球 IP 质量分布")
-        st.scatter_chart(df, x='jitter', y='loss', color='region', size='score')
-        st.caption("注：越靠近左下角 (低抖动/低丢包) 质量越好")
+    # 详细表格
+    st.subheader("📋 详细测试报告")
+    
+    # 定义表格列配置
+    col_config = {
+        "score": st.column_config.ProgressColumn("得分", format="%.0f", min_value=0, max_value=100),
+        "source": st.column_config.TextColumn("来源标签"),
+        "region": st.column_config.TextColumn("归属地"),
+        "gpt": st.column_config.TextColumn("GPT 资格"),
+        "cn_lat": st.column_config.NumberColumn("延迟(ms)", format="%d"),
+        "loss": st.column_config.NumberColumn("丢包(%)", format="%d"),
+        "speed": st.column_config.NumberColumn("速度(MB/s)", format="%.2f"),
+    }
+    
+    # 展示数据
+    st.dataframe(
+        df,
+        column_order=("score", "ip", "source", "region", "gpt", "cn_lat", "loss", "speed"),
+        column_config=col_config,
+        use_container_width=True,
+        hide_index=True
+    )
 
 else:
-    st.warning("📡 系统正在进行首次全球扫描与地理定位... 请稍候 20 秒")
+    st.warning("🐼 正在为四川电信线路进行首次选路与 GPT 检测... 请稍候 20 秒")
     st.progress(0.4)
     time.sleep(5)
     st.rerun()
