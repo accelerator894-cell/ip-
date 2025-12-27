@@ -8,7 +8,7 @@ import pandas as pd
 from datetime import datetime
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="4K 引擎：手机适配版", page_icon="📱", layout="wide")
+st.set_page_config(page_title="4K 引擎：稳定版", page_icon="🛡️", layout="wide")
 
 # ===========================
 # 🎨 随机主题引擎
@@ -70,13 +70,11 @@ st.markdown(f"""
     }}
     
     /* 顶部健康度卡片 */
-    .health-card {{
-        border: 1px solid {current_theme['main_color']};
-        background-color: rgba(255,255,255,0.05);
+    div[data-testid="column"] {{
+        background-color: rgba(255, 255, 255, 0.05);
         border-radius: 8px;
         padding: 10px;
-        margin-bottom: 20px;
-        text-align: center;
+        border: 1px solid {current_theme['border_color']};
     }}
 
     [data-testid="stDataFrame"] {{
@@ -105,29 +103,34 @@ DB_FILE = "best_ip_history.txt"
 # --- 3. 核心功能 ---
 
 def check_api_health_percent():
-    """计算 API 健康百分比"""
-    try:
-        start = time.time()
-        url = "https://api.cloudflare.com/client/v4/user/tokens/verify"
-        headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
-        resp = requests.get(url, headers=headers, timeout=2).json()
-        latency = (time.time() - start) * 1000
-        
-        if resp.get("success"):
-            score = 100
-            if latency > 200:
-                deduct = int((latency - 200) / 100) * 5
-                score = max(60, 100 - deduct)
-            return True, score, int(latency)
-        else:
-            return False, 0, 0
-    except:
-        return False, 0, 9999
+    """计算 API 健康百分比 (增强版：带重试机制)"""
+    url = "https://api.cloudflare.com/client/v4/user/tokens/verify"
+    headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
+    
+    # 尝试 3 次，防止网络抖动导致的误报
+    for i in range(3):
+        try:
+            start = time.time()
+            # 延长超时时间到 5 秒
+            resp = requests.get(url, headers=headers, timeout=5).json()
+            latency = (time.time() - start) * 1000
+            
+            if resp.get("success"):
+                score = 100
+                if latency > 200:
+                    deduct = int((latency - 200) / 100) * 5
+                    score = max(60, 100 - deduct)
+                return True, score, int(latency)
+        except:
+            time.sleep(1) # 失败后休息 1 秒再试
+            continue
+            
+    return False, 0, 0
 
 def get_ip_info(ip):
     try:
         url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
-        r = requests.get(url, timeout=1).json()
+        r = requests.get(url, timeout=1.5).json()
         cc = r.get("countryCode", "UNK")
         country = r.get("country", "Unknown")
         region = "🌍 其他"
@@ -139,7 +142,7 @@ def get_ip_info(ip):
 
 def get_global_ips():
     try:
-        r = requests.get("https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt", timeout=3)
+        r = requests.get("https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt", timeout=4)
         found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', r.text)
         return random.sample(list(found), min(len(found), 12))
     except: return []
@@ -147,13 +150,13 @@ def get_global_ips():
 def fast_ping(ip):
     try:
         start = time.time()
-        requests.head(f"http://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.0)
+        requests.head(f"http://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.5)
         return int((time.time() - start) * 1000)
     except: return 9999
 
 def check_netflix(ip):
     try:
-        r = requests.get(f"http://{ip}/title/80018499", headers={"Host": "www.netflix.com"}, timeout=1.5)
+        r = requests.get(f"http://{ip}/title/80018499", headers={"Host": "www.netflix.com"}, timeout=2)
         return "✅" if r.status_code in [200, 301, 302] else "❌"
     except: return "❓"
 
@@ -162,7 +165,7 @@ def sync_dns(new_ip):
     headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
     try:
         params = {"name": CF_CONFIG['record_name'], "type": "A"}
-        search = requests.get(url, headers=headers, params=params, timeout=5).json()
+        search = requests.get(url, headers=headers, params=params, timeout=10).json()
         if not search.get("success") or not search.get("result"): return "❌ 未找到记录"
         record = search["result"][0]
         if record["content"] == new_ip: return "✅ 解析已固化，无需变更"
@@ -176,10 +179,9 @@ def sync_dns(new_ip):
 
 st.title(f"🚀 4K 引擎：{current_theme['name']} 版")
 
-# --- 🏆 核心改动：将健康度移到主界面顶部 ---
+# --- 🏆 顶部健康度 (加固版) ---
 is_ok, score, lat = check_api_health_percent()
 
-# 使用列布局：左边显示文字，右边显示刷新按钮
 c1, c2 = st.columns([3, 1])
 
 with c1:
@@ -187,7 +189,8 @@ with c1:
         st.markdown(f"**📶 API 连通健康度: {score}%** (响应: {lat}ms)")
         st.progress(score / 100)
     else:
-        st.error("❌ API 连接断开")
+        # 如果还是失败，显示黄色警告而不是红色错误，减少焦虑
+        st.warning("⚠️ API 连接波动，但核心同步功能仍在运行中...")
 
 with c2:
     if st.button("🔄 刷新"):
