@@ -10,6 +10,7 @@ import concurrent.futures
 import statistics
 import socket
 import threading
+import ipaddress
 from datetime import datetime
 import urllib3
 
@@ -19,17 +20,26 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ===========================
 # 1. 全局配置与常量
 # ===========================
-st.set_page_config(page_title="VLESS 智能进化版", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="VLESS 猎手进化版", page_icon="🧬", layout="wide")
 
 RESULT_FILE = "scan_results.json"   # 前端展示
-DB_FILE = "ip_database.json"        # 正式精英库 (老兵)
-CRAWLER_FILE = "crawler_pool.json"  # 爬虫缓冲池 (新兵训练营)
+DB_FILE = "ip_database.json"        # 精英库 (老兵)
+CRAWLER_FILE = "crawler_pool.json"  # 普通爬虫池 (GitHub来源)
+NICHE_FILE = "niche_pool.json"      # 💎 冷门专用池 (黄金段位生成)
 CONFIG_FILE = "app_config.json"     # 配置
 
 # 极速启动种子
 QUICK_SEEDS = [
     "104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1", 
     "104.16.16.16", "104.24.24.24", "172.64.0.1", "104.18.18.18"
+]
+
+# 💎 黄金冷门段位 (这些段位通常质量较高，但很少在公开列表刷屏)
+# 这里避开了最拥堵的 104.16.0.0/12 的大部分，选择了一些特定的切片
+GOLDEN_SUBNETS = [
+    "104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", 
+    "172.64.0.0/13", "103.21.244.0/22", "103.22.200.0/22",
+    "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18"
 ]
 
 st.markdown("""
@@ -48,7 +58,7 @@ st.markdown("""
 # ===========================
 
 class IPDatabase:
-    """正式精英数据库 (只存最好的)"""
+    """正式精英数据库"""
     def __init__(self, filepath):
         self.filepath = filepath
         self.lock = threading.Lock()
@@ -72,27 +82,24 @@ class IPDatabase:
 
     def update_ip(self, ip, stats):
         with self.lock:
-            # 只有分数合格才进入正式库 (例如 > 40分)
-            if stats['score'] < 40: return 
-            
+            if stats['score'] < 30: return # 门槛稍低一点，允许更多样本进入
             if ip not in self.data:
                 self.data[ip] = stats
             else:
-                # 优胜劣汰：只有新成绩更好才更新核心数据
                 old = self.data[ip].get('score', 0)
                 if stats['score'] >= old:
                     stats['created_at'] = self.data[ip].get('created_at', stats['last_test'])
                     self.data[ip] = stats
                 else:
-                    self.data[ip]['last_test'] = stats['last_test'] # 仅更新活跃时间
-
+                    self.data[ip]['last_test'] = stats['last_test']
+    
     def get_top_ips(self, limit=20):
         valid = list(self.data.values())
         valid.sort(key=lambda x: x.get('score', 0), reverse=True)
         return valid[:limit]
 
-class CrawlerPool:
-    """爬虫缓冲池 (新兵营)，最大存20个"""
+class BasePool:
+    """池基类"""
     def __init__(self, filepath, max_size=20):
         self.filepath = filepath
         self.max_size = max_size
@@ -110,37 +117,56 @@ class CrawlerPool:
         with self.lock:
             with open(self.filepath, "w") as f: json.dump(self.ips, f)
 
+    def get_batch(self, batch_size=5):
+        with self.lock:
+            return self.ips[:batch_size]
+
+    def remove_batch(self, tested_ips):
+        with self.lock:
+            self.ips = [ip for ip in self.ips if ip not in tested_ips]
+            self.save()
+
+class CrawlerPool(BasePool):
+    """普通爬虫池 (GitHub 来源)"""
     def fill_pool(self):
-        """如果池子没满，去公网抓取补充"""
         if len(self.ips) >= self.max_size: return
         try:
             url = "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"
             txt = requests.get(url, timeout=4).text
             found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
-            
-            # 随机打乱抓取结果
             random.shuffle(found)
-            
             with self.lock:
                 for ip in found:
                     if len(self.ips) >= self.max_size: break
-                    if ip not in self.ips:
-                        self.ips.append(ip)
+                    if ip not in self.ips: self.ips.append(ip)
             self.save()
         except: pass
 
-    def get_batch(self, batch_size=5):
-        """取出一批去送死(测试)"""
+class NichePool(BasePool):
+    """💎 冷门优质池 (基于 CIDR 随机生成，不依赖公共列表)"""
+    def fill_pool(self):
+        if len(self.ips) >= self.max_size: return
+        
+        # 核心逻辑：从黄金段位中随机生成 IP
+        new_ips = []
+        target_count = self.max_size - len(self.ips)
+        
+        for _ in range(target_count + 5): # 多生成一点备用
+            subnet_str = random.choice(GOLDEN_SUBNETS)
+            try:
+                # 随机生成该网段下的一个 IP
+                network = ipaddress.ip_network(subnet_str, strict=False)
+                # 简单随机算法：网络地址 + 随机整数
+                random_int = random.randint(1, network.num_addresses - 2)
+                generated_ip = str(network.network_address + random_int)
+                new_ips.append(generated_ip)
+            except: pass
+            
         with self.lock:
-            # 取出前N个
-            batch = self.ips[:batch_size]
-            return batch
-
-    def remove_batch(self, tested_ips):
-        """测试完了，无论死活都从池子里踢出去"""
-        with self.lock:
-            self.ips = [ip for ip in self.ips if ip not in tested_ips]
-            self.save()
+            for ip in new_ips:
+                if len(self.ips) >= self.max_size: break
+                if ip not in self.ips: self.ips.append(ip)
+        self.save()
 
 # ===========================
 # 3. 辅助函数
@@ -155,11 +181,11 @@ def get_config():
 def save_config(new_conf):
     curr = get_config()
     curr.update(new_conf)
-    with open(CONFIG_FILE, "w", encoding='utf-8') as f: json.dump(curr, f, indent=2)
+    with open(CONFIG_FILE, "w", encoding='utf-8') as f: json.dump(curr, f, indent=2, ensure_ascii=False)
 
 def get_geo_info(ip):
     try:
-        r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp,hosting", timeout=2).json()
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp,hosting", timeout=1.5).json()
         cc = r.get("countryCode", "US")
         return {"cc": cc, "gpt": "✅" if cc not in ['CN','HK','RU','IR','KP'] else "❌", "is_native": not r.get("hosting", True)}
     except: return {"cc": "Unk", "gpt": "❓", "is_native": False}
@@ -188,20 +214,21 @@ def calculate_score(mode, p0, speed, geo):
 
 def classify_ip(p0, speed, geo):
     tags = []
-    if p0['loss'] == 0 and p0['jitter'] < 10: tags.append("🎮 游戏/金融")
-    if p0['avg'] < 140: tags.append("⚡ 极速")
+    if p0['loss'] == 0 and p0['jitter'] < 10: tags.append("🎮 稳")
+    if p0['avg'] < 140: tags.append("⚡ 快")
     if geo['is_native']: tags.append("🎬 原生")
     if geo['gpt'] == "✅": tags.append("🤖 GPT")
     tags.append(geo['cc'])
     return tags
 
 # ===========================
-# 4. 后台进化线程 (Worker)
+# 4. 后台进化线程 (双核驱动)
 # ===========================
 
 def background_worker():
     db = IPDatabase(DB_FILE)
-    pool = CrawlerPool(CRAWLER_FILE, max_size=20) # 限制爬虫池最大20个
+    std_pool = CrawlerPool(CRAWLER_FILE, max_size=20)   # 普通池
+    niche_pool = NichePool(NICHE_FILE, max_size=20)     # 💎 冷门池
     
     while True:
         try:
@@ -210,35 +237,38 @@ def background_worker():
             
             scan_targets = []
             
-            # 1. 种子选手 (永远保留)
+            # 1. 种子 (保底)
             scan_targets.extend([{"ip": ip, "src": "⚡ 种子"} for ip in QUICK_SEEDS])
             
-            # 2. 历史精英 (复查)
-            top_db = db.get_top_ips(10)
+            # 2. 历史精英 (优选)
+            top_db = db.get_top_ips(12)
             for item in top_db:
                 scan_targets.append({"ip": item['ip'], "src": "📂 历史"})
             
-            # 3. 爬虫池新兵 (关键修改)
-            # 先尝试填满池子
-            pool.fill_pool()
-            # 从池子里拿出 5-8 个进行测试
-            new_recruits = pool.get_batch(8) 
-            for ip in new_recruits:
-                scan_targets.append({"ip": ip, "src": "🕷️ 爬虫"})
+            # 3. 填充并获取新 IP (双源获取)
+            std_pool.fill_pool()
+            niche_pool.fill_pool()
             
-            # 去重
+            # 从普通池拿 6 个
+            for ip in std_pool.get_batch(6):
+                scan_targets.append({"ip": ip, "src": "🕷️ 爬虫"})
+                
+            # 从冷门池拿 6 个 (高优先级)
+            for ip in niche_pool.get_batch(6):
+                scan_targets.append({"ip": ip, "src": "💎 冷门"})
+            
             unique_targets = {v['ip']:v for v in scan_targets}.values()
             
             # --- 执行并发测试 ---
             current_results = []
-            tested_pool_ips = [] # 记录哪些爬虫IP被测试了
+            tested_ips_std = [] 
+            tested_ips_niche = []
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
                 def task(target):
                     ip = target['ip']
                     port = cfg.get('port', 443)
                     
-                    # 基础筛选
                     p0 = ping0_test(ip, port)
                     if p0['loss'] > 40: return None 
                     
@@ -246,17 +276,20 @@ def background_worker():
                     try:
                         st_t = time.perf_counter()
                         url = f"http://{ip}/__down?bytes=200000"
-                        r = requests.get(url, headers={"Host": "speed.cloudflare.com"}, timeout=3)
+                        r = requests.get(url, headers={"Host": "speed.cloudflare.com"}, timeout=2.5)
                         if r.status_code == 200:
                             speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
                     geo = get_geo_info(ip)
-                    score = calculate_score(mode, p0, speed, geo)
                     
-                    # 记录这个IP是来自爬虫的，方便后续从池子删除
-                    if target['src'] == "🕷️ 爬虫":
-                        tested_pool_ips.append(ip)
+                    # 冷门 IP 给予微小的分数加成，鼓励使用冷门 IP
+                    bonus = 5 if target['src'] == "💎 冷门" else 0
+                    score = calculate_score(mode, p0, speed, geo) + bonus
+                    
+                    # 记录来源以便后续清理池子
+                    if target['src'] == "🕷️ 爬虫": tested_ips_std.append(ip)
+                    if target['src'] == "💎 冷门": tested_ips_niche.append(ip)
 
                     if score <= 10: return None
                     
@@ -271,26 +304,24 @@ def background_worker():
                     r = f.result()
                     if r: 
                         current_results.append(r)
-                        # 🔥 晋升机制：只有优秀的才存入正式DB
                         db.update_ip(r['ip'], r)
 
-            # --- 收尾工作 ---
-            # 1. 从爬虫池中移除已测试的IP (无论好坏，腾出位置给下一批新IP)
-            if tested_pool_ips:
-                pool.remove_batch(tested_pool_ips)
+            # --- 清理池子 ---
+            if tested_ips_std: std_pool.remove_batch(tested_ips_std)
+            if tested_ips_niche: niche_pool.remove_batch(tested_ips_niche)
 
-            # 2. 保存结果供前端显示
+            # --- 保存状态 ---
             if current_results:
                 db.save()
                 current_results.sort(key=lambda x: x['score'], reverse=True)
                 
-                # 更新状态
                 state = {
                     "last_run": datetime.now().strftime("%H:%M:%S"),
                     "mode": mode,
                     "winner": current_results[0],
                     "table": current_results[:50],
-                    "pool_size": len(pool.ips) # 调试用：显示池子剩余数量
+                    "std_pool": len(std_pool.ips),
+                    "niche_pool": len(niche_pool.ips)
                 }
                 
                 tmp = RESULT_FILE + ".tmp"
@@ -298,7 +329,7 @@ def background_worker():
                 os.replace(tmp, RESULT_FILE)
 
         except Exception as e: print(f"Err: {e}")
-        time.sleep(8) # 休息一下
+        time.sleep(8) 
 
 if "bg_thread" not in st.session_state:
     t = threading.Thread(target=background_worker, daemon=True)
@@ -317,7 +348,7 @@ with st.sidebar:
     new_mode = st.radio("优选策略", modes, index=idx)
     
     st.markdown("---")
-    with st.expander("⚙️ 扫描参数设置"):
+    with st.expander("⚙️ 扫描参数"):
         new_host = st.text_input("伪装域名", value=cfg.get("host", "speed.cloudflare.com"))
         new_port = st.number_input("端口", value=cfg.get("port", 443))
         
@@ -327,7 +358,7 @@ with st.sidebar:
         if os.path.exists(RESULT_FILE): os.remove(RESULT_FILE)
         time.sleep(1); st.rerun()
 
-st.title("🧬 Cloudflare 优选 IP 监控台")
+st.title("🧬 Cloudflare 猎手进化版 (双核驱动)")
 
 if os.path.exists(RESULT_FILE):
     try:
@@ -340,26 +371,31 @@ if os.path.exists(RESULT_FILE):
         c2.metric("延迟", f"{winner['avg']} ms")
         c3.metric("速度", f"{winner['speed']} MB/s")
         c4.metric("得分", f"{winner['score']}")
-        st.caption(f"特性: {winner['tags']}")
+        st.caption(f"特性: {winner['tags']} | 来源: {winner['src']}")
         
         st.divider()
         st.subheader(f"🧬 基因库 (策略: {data['mode']})")
-        st.text(f"🕷️ 爬虫池存量: {data.get('pool_size', 0)} / 20 (自动补充中)")
+        
+        # 显示双池状态
+        col_p1, col_p2 = st.columns(2)
+        col_p1.info(f"🕷️ 普通爬虫池: {data.get('std_pool', 0)} / 20 (GitHub)")
+        col_p2.success(f"💎 冷门优质池: {data.get('niche_pool', 0)} / 20 (黄金段位生成)")
         
         df = pd.DataFrame(data['table'])
         if 'tags' in df.columns: df['tags'] = df['tags'].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x))
         
         st.dataframe(
             df,
-            column_order=("score", "ip", "avg", "loss", "speed", "tags", "src"),
+            column_order=("score", "src", "ip", "avg", "loss", "speed", "tags"),
             column_config={
                 "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=100, format="%.0f"),
                 "speed": st.column_config.NumberColumn("速度", format="%.2f MB"),
+                "src": st.column_config.TextColumn("来源"),
             },
             use_container_width=True, hide_index=True
         )
     except: st.warning("🔄 数据刷新中..."); time.sleep(1); st.rerun()
 else:
-    st.info("🧬 初始化爬虫池并进行首轮测试..."); time.sleep(2); st.rerun()
+    st.info("🧬 初始化双核引擎并进行首轮测试..."); time.sleep(2); st.rerun()
 
 time.sleep(5); st.rerun()
