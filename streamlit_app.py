@@ -15,26 +15,30 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置
+# 1. 页面配置与黑客风 UI
 # ===========================
-st.set_page_config(page_title="VLESS 全场景竞速版", page_icon="🎛️", layout="wide")
+st.set_page_config(page_title="VLESS 终极全能版", page_icon="🎛️", layout="wide")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; color: #ffffff; }
     div[data-testid="column"] { background-color: #1a1c24; border: 1px solid #2d3139; border-radius: 8px; padding: 15px; }
     
-    /* 模式徽章 */
+    /* 模式徽章样式 */
     .badge-normal { background-color: #2ECC40; color: #000; padding: 4px 10px; border-radius: 4px; font-weight: bold; }
     .badge-peak { background-color: #0074D9; color: #fff; padding: 4px 10px; border-radius: 4px; font-weight: bold; }
     .badge-native { background-color: #B10DC9; color: #fff; padding: 4px 10px; border-radius: 4px; font-weight: bold; }
     
+    /* Ping0 风格数值 */
     .ping0-value { color: #00ff41; font-family: 'Courier New', monospace; font-size: 1.4rem; }
+    
+    /* 标签 */
+    .tag-seed { background-color: #FFDC00; color: #000; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
 # ===========================
-# 2. 配置与文件
+# 2. 配置加载
 # ===========================
 try:
     CF_CONFIG = {
@@ -43,13 +47,13 @@ try:
         "record_name": st.secrets["record_name"].strip(),
     }
 except:
-    st.error("❌ 配置缺失！请检查 secrets.toml")
+    st.error("❌ 配置缺失！请在 Streamlit Secrets 中配置 api_token, zone_id, record_name")
     st.stop()
 
 SAVED_IP_FILE = "good_ips.txt"
 
 # ===========================
-# 3. 核心工具与生成器
+# 3. 核心工具函数
 # ===========================
 
 def generate_cold_ips(count=30):
@@ -59,16 +63,18 @@ def generate_cold_ips(count=30):
 
 @st.cache_data(ttl=3600)
 def get_ip_extended_info(ip):
+    """获取 IP 的 ISP 和是否为原生"""
     try:
-        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country,isp,hosting", timeout=2).json()
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country,isp,hosting", timeout=2.5).json()
         return {
             "country": r.get("country", "Unk"),
             "isp": r.get("isp", "Unk"),
-            "is_native": not r.get("hosting", True) # hosting=False 意味着是原生
+            "is_native": not r.get("hosting", True) # hosting=False 即为原生
         }
     except: return {"country": "Unk", "isp": "Unk", "is_native": False}
 
 def ping0_tcp_test(ip, count=5):
+    """Ping0 级 TCP 握手测速"""
     lats, success = [], 0
     for _ in range(count):
         try:
@@ -90,69 +96,90 @@ def ping0_tcp_test(ip, count=5):
     }
 
 def get_pool(mode):
-    """根据模式动态构建选手池"""
+    """
+    【修复版】构建选手池，包含强制保底机制
+    """
     pool = []
     seen = set()
     
-    # 1. 历史库 (所有模式都加载)
+    # 1. 历史库
     if os.path.exists(SAVED_IP_FILE):
         with open(SAVED_IP_FILE, "r") as f:
             for ip in re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', f.read()):
-                pool.append({"ip": ip, "type": "history"})
-                seen.add(ip)
+                if ip not in seen:
+                    pool.append({"ip": ip, "type": "history"})
+                    seen.add(ip)
 
-    # 2. 避峰模式：强制注入大量冷门 IP
-    if mode == "🌙 晚高峰避峰":
+    # 2. 避峰模式注入冷门 IP
+    if mode == "🌙 晚高峰避峰排位":
         cold_ips = generate_cold_ips(60)
         for ip in cold_ips:
             if ip not in seen:
                 pool.append({"ip": ip, "type": "cold"})
                 seen.add(ip)
     
-    # 3. 通用优选源 (所有模式都抓，原生模式依靠筛选)
-    urls = ["https://raw.githubusercontent.com/DerGoogler/CloudFlare-IP-Best/main/ip.txt", 
-            "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
+    # 3. 在线爬虫 (增加官方源)
+    urls = [
+        "https://www.cloudflare.com/ips-v4", # 官方源，最稳
+        "https://raw.githubusercontent.com/DerGoogler/CloudFlare-IP-Best/main/ip.txt", 
+        "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"
+    ]
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
         def fetch(u):
-            try: return re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', requests.get(u, timeout=4).text)
+            try: 
+                # 6秒超时，防止爬虫卡死
+                return re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', requests.get(u, headers={'User-Agent': 'Mozilla/5.0'}, timeout=6).text)
             except: return []
+        
         for res in ex.map(fetch, urls):
-            # 原生模式下多抓一点，增加命中概率
-            sample_size = 150 if mode == "🧬 原生IP优先" else 80
-            for ip in random.sample(res, min(len(res), sample_size)):
-                if ip not in seen:
-                    pool.append({"ip": ip, "type": "hot"})
-                    seen.add(ip)
+            sample_size = 150 if mode == "🧬 原生IP分数排位" else 80
+            if res:
+                for ip in random.sample(res, min(len(res), sample_size)):
+                    if ip not in seen:
+                        pool.append({"ip": ip, "type": "hot"})
+                        seen.add(ip)
     
+    # === 【兜底修复】 ===
+    # 如果此时节点过少（比如爬虫失败），强制注入保底种子
+    if len(pool) < 5:
+        seeds = [
+            "1.1.1.1", "1.0.0.1", "104.16.0.1", "104.17.0.1", "104.18.0.1",
+            "172.67.1.1", "104.21.1.1", "188.114.96.1", "188.114.97.1",
+            "162.159.192.1", "198.41.214.1", "172.64.198.1"
+        ]
+        for ip in seeds:
+            if ip not in seen:
+                pool.append({"ip": ip, "type": "seed"})
+                seen.add(ip)
+                
     return pool
 
 def calculate_score(mode, p0, speed, info, node_type):
-    """【核心】三模评分引擎"""
+    """三模评分引擎"""
     score = 100
     
-    # A. 🌙 晚高峰策略：稳字当头
-    if mode == "🌙 晚高峰避峰":
-        score -= (p0['loss'] * 50)     # 极刑：丢包直接扣光
-        score -= (p0['jitter'] * 5)    # 严惩抖动
-        score -= (p0['avg'] / 10)      # 宽容延迟 (200ms 只扣 20分)
+    # A. 避峰模式：稳字当头
+    if mode == "🌙 晚高峰避峰排位":
+        score -= (p0['loss'] * 50)     
+        score -= (p0['jitter'] * 5)    
+        score -= (p0['avg'] / 10)      
         score += (speed * 8)
-        if node_type == "cold": score += 20 # 冷门段补贴
+        if node_type == "cold": score += 20 
         
-    # B. 🧬 原生IP策略：原生至上
-    elif mode == "🧬 原生IP优先":
+    # B. 原生模式：原生至上
+    elif mode == "🧬 原生IP分数排位":
         score -= (p0['loss'] * 20)
-        score -= (p0['avg'] / 4)       # 还要看延迟，不能太慢
+        score -= (p0['avg'] / 4)       
         score += (speed * 10)
-        # 霸道加分：如果是原生，直接起飞，确保第一
-        if info['is_native']: score += 1000 
+        if info['is_native']: score += 1000 # 霸道加分
         
-    # C. ☀️ 正常策略：性能平衡
+    # C. 均衡模式
     else:
         score -= (p0['loss'] * 20)
-        score -= (p0['avg'] / 5)       # 正常看重延迟
+        score -= (p0['avg'] / 5)       
         score -= (p0['jitter'] * 1)
-        score += (speed * 15)          # 鼓励高速
+        score += (speed * 15)          
 
     return round(score, 1)
 
@@ -161,14 +188,13 @@ def deep_test_node(node, mode):
     
     # 1. 基础连通性
     p0 = ping0_tcp_test(ip)
-    # 晚高峰放宽筛选，其他模式严格筛选
-    limit = 800 if mode == "🌙 晚高峰避峰" else 500
+    limit = 800 if mode == "🌙 晚高峰避峰排位" else 600
     if p0['avg'] > limit: return None
     
-    # 2. 信息获取 (原生模式必须查，其他模式可跳过节省时间？不，为了展示都查)
+    # 2. 信息获取
     info = get_ip_extended_info(ip)
     
-    # 3. 速度测试
+    # 3. 速度测试 (2MB)
     speed = 0.0
     try:
         s = time.perf_counter()
@@ -180,10 +206,9 @@ def deep_test_node(node, mode):
     # 4. 计算得分
     score = calculate_score(mode, p0, speed, info, node['type'])
     
-    # 优质节点入库 (原生模式下只存原生)
-    save_threshold = 85
-    should_save = score > save_threshold
-    if mode == "🧬 原生IP优先" and not info['is_native']: should_save = False
+    # 入库判断
+    should_save = score > 85
+    if mode == "🧬 原生IP分数排位" and not info['is_native']: should_save = False
     
     if should_save:
         with open(SAVED_IP_FILE, "a") as f: f.write(f"{ip}\n")
@@ -195,6 +220,7 @@ def deep_test_node(node, mode):
     }
 
 def sync_dns(ip):
+    """同步 IP 到 Cloudflare"""
     url = f"https://api.cloudflare.com/client/v4/zones/{CF_CONFIG['zone_id']}/dns_records"
     headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
     try:
@@ -203,31 +229,31 @@ def sync_dns(ip):
             rid = recs["result"][0]["id"]
             if recs["result"][0]["content"] == ip: return "✅ IP未变"
             requests.put(f"{url}/{rid}", headers=headers, json={"type":"A","name":CF_CONFIG['record_name'],"content":ip,"ttl":60,"proxied":False})
-            return f"🚀 解析同步: {ip}"
+            return f"🚀 已更新: {ip}"
     except: return "⚠️ API异常"
     return "❌ 记录无效"
 
 # ===========================
 # 4. 主控界面
 # ===========================
-st.title("🎛️ VLESS 全场景竞速中心")
+st.title("🎛️ VLESS 终极全能版")
 
 if "last_run" not in st.session_state: st.session_state.last_run = datetime.min
 if "auto_enabled" not in st.session_state: st.session_state.auto_enabled = True
 
 with st.sidebar:
     st.header("⚙️ 模式选择")
-    # 模式切换器
     mode = st.radio("🎯 请选择排位策略", 
                     ["☀️ 正常使用排位", "🌙 晚高峰避峰排位", "🧬 原生IP分数排位"],
-                    captions=["低延迟+高速 (日间)", "0丢包+防断流 (夜间)", "解锁流媒体 (Netflix)"])
+                    captions=["均衡模式 (日间)", "稳定防断流 (夜间)", "解锁流媒体 (Netflix)"])
     
     st.divider()
     st.session_state.auto_enabled = st.toggle("⏱️ 10分钟自动循环", value=st.session_state.auto_enabled)
     if st.button("🗑️ 清空库"):
         if os.path.exists(SAVED_IP_FILE): os.remove(SAVED_IP_FILE)
+        st.toast("缓存已清空")
 
-# 动态 UI 显示
+# UI 状态显示
 if mode == "☀️ 正常使用排位":
     st.markdown("当前状态: <span class='badge-normal'>BALANCED</span> 均衡模式", unsafe_allow_html=True)
 elif mode == "🌙 晚高峰避峰排位":
@@ -245,12 +271,11 @@ if manual or trigger:
     
     with st.status(f"🔍 正在执行 [{mode}] 策略...", expanded=True) as status:
         pool = get_pool(mode)
-        st.write(f"已加载 {len(pool)} 个候选节点...")
+        st.write(f"已加载 {len(pool)} 个候选节点 (含保底种子)...")
         
         results = []
         prog = st.progress(0)
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-            # 传入 mode 参数
             futs = [ex.submit(deep_test_node, x, mode) for x in pool]
             for i, f in enumerate(concurrent.futures.as_completed(futs)):
                 prog.progress((i+1)/len(pool))
@@ -263,26 +288,24 @@ if manual or trigger:
         winner = results[0]
         sync_msg = sync_dns(winner['ip'])
         
-        # 结果展示
+        # 冠军展示
         st.markdown(f"### 🏆 冠军: {winner['ip']}")
-        # 标签展示
         tags = f"📡 {winner['isp']}"
         if winner['is_native']: tags += " | <span class='badge-native'>🧬 原生IP</span>"
+        if winner['source'] == 'seed': tags += " | <span class='tag-seed'>🛡️ 保底种子</span>"
         st.markdown(tags, unsafe_allow_html=True)
         
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("策略得分", winner['score'])
-        c2.metric("延迟/抖动", f"{winner['tcp']} ms", f"±{winner['jitter']}")
-        c3.metric("下载带宽", f"{winner['speed']} MB/s")
-        c4.metric("解析状态", sync_msg)
+        c1.metric("得分", winner['score'])
+        c2.metric("延迟", f"{winner['tcp']} ms", f"±{winner['jitter']}")
+        c3.metric("带宽", f"{winner['speed']} MB/s")
+        c4.metric("解析", sync_msg)
         
         st.divider()
         df = pd.DataFrame(results)
-        
-        # 根据模式动态调整显示的列
         cols = ['score', 'ip', 'tcp', 'speed', 'isp']
-        if mode == "🌙 晚高峰避峰排位": cols.insert(2, 'loss') # 晚高峰强调丢包
-        if mode == "🧬 原生IP分数排位": cols.insert(1, 'is_native') # 原生模式强调原生标
+        if mode == "🌙 晚高峰避峰排位": cols.insert(2, 'loss')
+        if mode == "🧬 原生IP分数排位": cols.insert(1, 'is_native')
         
         st.dataframe(
             df[cols],
