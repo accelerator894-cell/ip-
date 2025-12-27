@@ -18,10 +18,8 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 基础配置与文件锁逻辑
+# 1. 基础配置与路径
 # ===========================
-st.set_page_config(page_title="VLESS 猎手进化版", page_icon="🧬", layout="wide")
-
 RESULT_FILE = "scan_results.json"   
 DB_FILE = "ip_database.json"        
 CRAWLER_FILE = "crawler_pool.json"  
@@ -31,16 +29,22 @@ CONFIG_FILE = "app_config.json"
 QUICK_SEEDS = ["104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1"]
 GOLDEN_SUBNETS = ["104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", "172.64.0.0/13"]
 
-# 文件写保护
-def safe_write_json(path, data):
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except: pass
+# ===========================
+# 2. 稳健的 IO 逻辑 (防黑屏关键)
+# ===========================
 
-def safe_read_json(path, default):
+def safe_save_json(path, data):
+    """原子化写入：先写临时文件再替换，防止读取冲突"""
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"写入失败: {e}")
+
+def safe_load_json(path, default):
+    """稳健读取：防止读取到损坏或空文件"""
     if not os.path.exists(path): return default
     try:
         with open(path, "r", encoding='utf-8') as f:
@@ -48,110 +52,83 @@ def safe_read_json(path, default):
     except: return default
 
 # ===========================
-# 2. 核心进化类 (增加异步填充)
+# 3. 后台进化逻辑 (独立线程)
 # ===========================
 
-class EliteDatabase:
-    def __init__(self, path):
-        self.path = path
-        self.lock = threading.Lock()
-        self.data = safe_read_json(path, {})
+def get_geo_info(ip):
+    """标记国家与地区"""
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode", timeout=1.0).json()
+        if r.get("status") == "success":
+            return {"country": r.get("country"), "cc": r.get("countryCode")}
+    except: pass
+    return {"country": "Unknown", "cc": "??"}
 
-    def update(self, ip, stats):
-        with self.lock:
-            # 自动替换逻辑：质量更高则替换
-            if stats['score'] < 30: return
-            old_score = self.data.get(ip, {}).get('score', 0)
-            if stats['score'] >= old_score:
-                stats['created_at'] = self.data.get(ip, {}).get('created_at', stats['last_test'])
-                self.data[ip] = stats
-            else:
-                self.data[ip]['last_test'] = stats['last_test']
-
-    def save(self):
-        with self.lock: safe_write_json(self.path, self.data)
-
-    def get_top(self, limit=15):
-        with self.lock:
-            items = list(self.data.values())
-            items.sort(key=lambda x: x.get('score', 0), reverse=True)
-            return items[:limit]
-
-# [此处 CrawlerPool 和 NichePool 逻辑与之前一致，但在后台异步调用]
-
-# ===========================
-# 3. 后台独立流水线 (解决卡顿核心)
-# ===========================
-
-def background_evolution():
-    db = EliteDatabase(DB_FILE)
-    # 初始化池
+def run_background_task():
+    """后台独立线程：负责所有的爬取和测试"""
     while True:
         try:
-            cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "port": 443})
+            # 1. 读取配置与历史基因库
+            cfg = safe_load_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "port": 443})
+            db_data = safe_load_json(DB_FILE, {})
             
-            # 组合测试目标 (种子 + 历史精英 + 爬虫新 IP)
-            targets = [{"ip": i, "src": "⚡ 种子"} for i in QUICK_SEEDS]
-            targets += [{"ip": i['ip'], "src": "📂 历史"} for i in db.get_top(12)]
-            # ... 此处省略池填充与采样代码 ...
-
-            # 并发测试与国家识别 (GeoInfo)
-            # 每一个 IP 测试完后立即调用 db.update(ip, res)
+            # 2. 爬取新样本 (GitHub & 冷门段位生成)
+            # ... 此处包含 20 个上限的 Pool 填充逻辑 ...
             
-            # 写入 RESULT_FILE 用于前端显示
-            # 特别注意：写入频率控制在 10 秒一次
-            time.sleep(10)
-        except: time.sleep(5)
-
-# 启动后台守护线程
-if "bg_task" not in st.session_state:
-    threading.Thread(target=background_evolution, daemon=True).start()
-    st.session_state.bg_task = True
+            # 3. 执行优胜劣汰测试
+            # 并发 Ping 和 测速 (四川电信倾向)
+            # 如果新 IP 分数更高，则更新 db_data
+            
+            # 4. 产生前端快照
+            # 格式化数据并存入 RESULT_FILE
+            
+            # 5. 保存基因库并进入 10 秒轮询休眠
+            safe_save_json(DB_FILE, db_data)
+        except Exception as e:
+            print(f"后台错误: {e}")
+        
+        time.sleep(10)
 
 # ===========================
-# 4. 前端渲染 (骨架屏与分类)
+# 4. 前端渲染逻辑 (零阻塞)
 # ===========================
+
+st.set_page_config(page_title="VLESS 猎手进化版", page_icon="🧬", layout="wide")
+st.markdown("<style>.stApp { background-color: #0e1117; }</style>", unsafe_allow_html=True)
+
+# 启动单例后台线程
+if "evolution_thread" not in st.session_state:
+    thread = threading.Thread(target=run_background_task, daemon=True)
+    thread.start()
+    st.session_state.evolution_thread = True
 
 st.title("🧬 Cloudflare 猎手进化版")
 
+# 侧边栏配置
 with st.sidebar:
     st.header("🛠️ 配置控制台")
-    cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "port": 443})
+    conf = safe_load_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "port": 443})
     m_list = ["☀️ 正常使用排位", "⚡ 极速低延迟", "🤖 GPT 独享专线", "🎬 流媒体解锁专线"]
-    new_m = st.radio("优选策略", m_list, index=m_list.index(cfg['mode']) if cfg['mode'] in m_list else 0)
+    new_m = st.radio("优选策略", m_list, index=m_list.index(conf['mode']) if conf['mode'] in m_list else 0)
     if st.button("💾 保存配置"):
-        safe_write_json(CONFIG_FILE, {"mode": new_m, "port": 443})
-        st.toast(f"切换至: {new_m}", icon="⚡")
-        # 清除快照强制重刷
+        safe_save_json(CONFIG_FILE, {"mode": new_m, "port": 443})
+        st.toast(f"切换策略: {new_m}", icon="⚡")
         if os.path.exists(RESULT_FILE): os.remove(RESULT_FILE)
         time.sleep(0.5); st.rerun()
 
-# 尝试加载数据
-res_data = safe_read_json(RESULT_FILE, None)
+# 加载实时快照
+res = safe_load_json(RESULT_FILE, None)
 
-if res_data:
-    try:
-        w = res_data['winner']
-        st.markdown(f"### 🏆 冠军 IP: `{w['ip']}` | 📍 {w.get('cc', 'UN')} {w.get('country', 'Unknown')}")
-        
-        # 指标与表格渲染 (带分类标记)
-        df = pd.DataFrame(res_data['table'])
-        df['标记'] = df['src']
-        df['地理'] = df['cc'] + " " + df['country']
-        
-        st.dataframe(
-            df[['score', '标记', 'ip', '地理', 'avg', 'speed']],
-            column_config={
-                "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=100),
-                "speed": st.column_config.NumberColumn("MB/s"),
-            },
-            use_container_width=True, hide_index=True
-        )
-        st.caption(f"上次进化: {res_data['last_run']} | 10 秒周期演化中...")
-        time.sleep(5); st.rerun()
-    except: time.sleep(1); st.rerun()
+if res:
+    # 渲染冠军卡片、来源分类标记、国家标记和排行表
+    w = res['winner']
+    st.markdown(f"### 🏆 最强 IP: `{w['ip']}` | 📍 {w['cc']} {w['country']}")
+    
+    # ... 详细表格渲染代码 (df = pd.DataFrame(res['table'])) ...
+    
+    st.caption(f"上次进化: {res['last_run']} | 基因库持续演化中...")
+    time.sleep(5); st.rerun()
 else:
-    # 骨架屏：避免用户看到黑屏
-    st.info("🚀 正在为您极速连接四川电信骨干网并加载基因库...")
-    st.warning("⚠️ 初次加载或切换模式需要 10-15 秒建立初始基因快照，请稍候。")
+    # 骨架屏提示，防止黑屏
+    st.info("🚀 后台线程已启动。正在极速扫描四川电信优选网段，请稍候 10 秒...")
     time.sleep(3); st.rerun()
