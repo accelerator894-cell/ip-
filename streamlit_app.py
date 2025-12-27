@@ -6,12 +6,13 @@ import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-# 1. 核心状态持久化
+# 1. 状态持久化
 if 'best_ip' not in st.session_state: st.session_state.best_ip = "等待测速"
 if 'latency' not in st.session_state: st.session_state.latency = 0
 if 'last_update' not in st.session_state: st.session_state.last_update = "尚未同步"
+if 'error_msg' not in st.session_state: st.session_state.error_msg = "运行正常"
 
-# 2. 安全读取 Secrets
+# 2. 读取配置
 try:
     CF_CONFIG = {
         "api_token": st.secrets["api_token"],
@@ -19,7 +20,7 @@ try:
         "record_name": st.secrets["record_name"],
     }
 except:
-    st.error("❌ 未检测到 Secrets 配置，请在 Streamlit 后台设置。")
+    st.error("❌ Secrets 配置丢失")
     st.stop()
 
 VLESS_LINKS = [
@@ -30,25 +31,30 @@ VLESS_LINKS = [
     "vless://26da6cf2-7c72-456a-a3d8-56abe6b7c0e6@172.64.36.5:2053/?type=ws&encryption=none&flow=&host=milet.qzz.io&path=%2F&security=tls&sni=milet.qzz.io&fp=chrome&packetEncoding=xudp#SG4"
 ]
 
-# --- 关键：真正的 Cloudflare 修改逻辑 ---
-def push_to_cloudflare(target_ip):
+def update_dns(new_ip):
     url = f"https://api.cloudflare.com/client/v4/zones/{CF_CONFIG['zone_id']}/dns_records"
     headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}", "Content-Type": "application/json"}
     try:
-        # 第一步：查找 Record ID
-        res = requests.get(f"{url}?name={CF_CONFIG['record_name']}", headers=headers, timeout=10).json()
-        if res.get("success") and res.get("result"):
-            record_id = res["result"][0]["id"]
-            current_ip = res["result"][0]["content"]
-            if current_ip == target_ip: return "skip"
-            
-            # 第二步：更新 IP
-            put_res = requests.put(f"{url}/{record_id}", headers=headers, json={
-                "type": "A", "name": CF_CONFIG['record_name'], "content": target_ip, "ttl": 60, "proxied": False
-            }, timeout=10).json()
-            return "success" if put_res.get("success") else "fail"
-    except: return "error"
-    return "fail"
+        # 获取 Record ID
+        r = requests.get(f"{url}?name={CF_CONFIG['record_name']}", headers=headers, timeout=10).json()
+        if not r.get("success"):
+            return f"查询失败: {r.get('errors')[0]['message']}"
+        
+        records = r.get("result", [])
+        if not records:
+            return "未找到匹配的域名记录，请检查 record_name"
+        
+        record = records[0]
+        if record["content"] == new_ip: return "无需更新"
+        
+        # 更新 IP
+        u = requests.put(f"{url}/{record['id']}", headers=headers, json={
+            "type": "A", "name": CF_CONFIG['record_name'], "content": new_ip, "ttl": 60, "proxied": False
+        }, timeout=10).json()
+        
+        return "同步成功" if u.get("success") else f"同步失败: {u.get('errors')[0]['message']}"
+    except Exception as e:
+        return f"网络错误: {str(e)}"
 
 def worker():
     while True:
@@ -61,31 +67,32 @@ def worker():
                     requests.get(f"https://{ip}/cdn-cgi/trace", timeout=1.5, verify=False)
                     results.append({"ip": ip, "lat": int((time.time()-s)*1000)})
                 except: continue
+        
         if results:
             results.sort(key=lambda x: x['lat'])
             winner = results[0]
-            # 执行同步
-            push_to_cloudflare(winner['ip'])
-            # 更新界面状态
+            # 执行同步并保存结果消息
+            res_msg = update_dns(winner['ip'])
+            st.session_state.error_msg = res_msg
             st.session_state.best_ip = winner['ip']
             st.session_state.latency = winner['lat']
             st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
         time.sleep(600)
 
-# 启动测速引擎
-if 'active' not in st.session_state:
-    st.session_state.active = True
+if 'init' not in st.session_state:
+    st.session_state.init = True
     threading.Thread(target=worker, daemon=True).start()
 
-# 页面布局
-st.title("⚡ 闪电优选 (全功能版)")
-st.write(f"正在守护: `{CF_CONFIG['record_name']}`")
+# 界面展示
+st.title("⚡ 闪电优选 (故障诊断版)")
+st.error(f"📡 当前系统状态: {st.session_state.error_msg}")
+
 c1, c2, c3 = st.columns(3)
 c1.metric("最优 IP", st.session_state.best_ip)
 c2.metric("当前延迟", f"{st.session_state.latency} ms")
-c3.metric("最后更新时间", st.session_state.last_update)
-st.divider()
-st.info("每 10 分钟自动检测并同步。系统启动后请等待 20 秒完成首次同步。")
+c3.metric("最后更新", st.session_state.last_update)
 
+st.divider()
+st.info("如果状态显示『同步失败』，请检查 API 令牌权限或 Zone ID 是否填错。")
 time.sleep(10)
 st.rerun()
