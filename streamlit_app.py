@@ -19,9 +19,7 @@ from collections import defaultdict
 # 禁用警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==============================
-#          日志配置
-# ==============================
+# 日志配置
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-5s | %(message)s',
@@ -29,9 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==============================
-#          文件路径 & 配置
-# ==============================
+# 文件路径
 BASE_DIR = Path(__file__).parent
 FILES = {
     "results": BASE_DIR / "scan_results.json",
@@ -40,9 +36,10 @@ FILES = {
     "niches": BASE_DIR / "niche_pool.json",
     "config": BASE_DIR / "app_config.json",
     "blacklist": BASE_DIR / "blacklist.json",
-    "fail_count": BASE_DIR / "fail_count.json"  # 新增：失败计数
+    "fail_count": BASE_DIR / "fail_count.json"
 }
 
+# 默认配置
 DEFAULT_CONFIG = {
     "mode": "☀️ 正常使用排位",
     "host": "speed.cloudflare.com",
@@ -74,17 +71,14 @@ QUICK_SEEDS = [
 
 # 全局缓存
 geo_cache = {}
-fail_counts = defaultdict(int)  # ip -> 连续失败次数
+fail_counts = defaultdict(int)
 
-# ==============================
-#          基础工具
-# ==============================
 def safe_json(file_path: Path, default=None):
     if not file_path.exists():
         return default or {}
     try:
         return json.loads(file_path.read_text(encoding='utf-8'))
-    except:
+    except Exception:
         return default or {}
 
 def safe_write_json(file_path: Path, data):
@@ -93,25 +87,18 @@ def safe_write_json(file_path: Path, data):
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         tmp.replace(file_path)
     except Exception as e:
-        logger.error(f"写入 {file_path} 失败: {e}")
+        logger.error(f"写入文件失败 {file_path}: {e}")
 
-# ==============================
-#          多源地理位置查询（最重要改进）
-# ==============================
 def get_geo_info(ip: str, timeout=1.8) -> dict:
     now = time.time()
-
-    # 缓存命中
     if ip in geo_cache and geo_cache[ip]["expire"] > now:
         return geo_cache[ip]["data"]
 
     methods = [
-        # 优先级最高：ipinfo.io （建议注册免费token）
         {
             "name": "ipinfo",
             "url": f"https://ipinfo.io/{ip}/json",
             "headers": {"User-Agent": "cf-hunter/1.0"},
-            # 如果你有token可以加在这里： "Authorization": "Bearer xxxxx"
             "parser": lambda d: {
                 "cc": d.get("country", "??"),
                 "country": d.get("country", "未知"),
@@ -119,7 +106,6 @@ def get_geo_info(ip: str, timeout=1.8) -> dict:
                 "source": "ipinfo"
             }
         },
-        # 第二选择：ipapi.co
         {
             "name": "ipapi.co",
             "url": f"https://ipapi.co/{ip}/json/",
@@ -130,7 +116,6 @@ def get_geo_info(ip: str, timeout=1.8) -> dict:
                 "source": "ipapi.co"
             }
         },
-        # 第三：ipwhois.app
         {
             "name": "ipwhois",
             "url": f"https://ipwhois.app/json/{ip}",
@@ -141,13 +126,12 @@ def get_geo_info(ip: str, timeout=1.8) -> dict:
                 "source": "ipwhois"
             }
         },
-        # 保底：Cloudflare trace（只能得到 colo）
         {
             "name": "cf_trace",
             "url": f"http://{ip}/cdn-cgi/trace",
             "parser": lambda text: {
                 "cc": "??",
-                "country": f"CF数据中心: {text.split('colo=')[1].split('\n')[0] if 'colo=' in text else '未知'}",
+                "country": f"CF-Colo: {text.split('colo=')[1].split('\n')[0] if 'colo=' in text else '未知'}",
                 "city": "",
                 "source": "cf_trace"
             }
@@ -163,23 +147,17 @@ def get_geo_info(ip: str, timeout=1.8) -> dict:
             )
             if r.status_code != 200:
                 continue
-
             if method["name"] == "cf_trace":
                 data = method["parser"](r.text)
             else:
                 data = method["parser"](r.json())
-
             geo_cache[ip] = {"data": data, "expire": now + 3600 * DEFAULT_CONFIG["geo_cache_hours"]}
             return data
-        except:
+        except Exception:
             continue
 
-    # 全部失败
     return {"cc": "??", "country": "获取失败", "city": "", "source": "failed"}
 
-# ==============================
-#          IP池 & 黑名单管理
-# ==============================
 class IPPoolManager:
     @staticmethod
     def get_blacklist() -> set:
@@ -193,25 +171,55 @@ class IPPoolManager:
 
     @staticmethod
     def fill_crawler_pool(max_size=35):
-        # ... 保持原逻辑，略（与之前版本相同）
+        current = safe_json(FILES["crawlers"], [])
+        if len(current) >= max_size:
+            return
+        sources = [
+            "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt",
+            "https://cfip.shodan.uk/",
+            "https://api.chaoming.cc/cfip",
+        ]
+        found = set(current)
+        blacklist = IPPoolManager.get_blacklist()
+        for url in sources:
+            try:
+                r = requests.get(url, timeout=5)
+                ips = re.findall(r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)', r.text)
+                for ip in ips:
+                    if ip not in blacklist and ip not in found:
+                        found.add(ip)
+            except Exception:
+                pass
+        safe_write_json(FILES["crawlers"], list(found)[:max_size])
 
     @staticmethod
     def fill_niche_pool(max_size=35):
-        # ... 保持原逻辑，略
+        current = safe_json(FILES["niches"], [])
+        if len(current) >= max_size:
+            return
+        blacklist = IPPoolManager.get_blacklist()
+        new_ips = []
+        for _ in range(max_size * 4):
+            try:
+                net = ipaddress.ip_network(random.choice(GOLDEN_SUBNETS))
+                candidate = str(net.network_address + random.randint(1, net.num_addresses - 3))
+                if candidate not in blacklist and candidate not in current:
+                    new_ips.append(candidate)
+            except Exception:
+                continue
+        combined = list(set(current + new_ips))[:max_size]
+        safe_write_json(FILES["niches"], combined)
 
-# ==============================
-#          进化引擎（核心）
-# ==============================
 def evolution_engine():
-    db = safe_json(FILES["database"])
     global fail_counts
+    db = safe_json(FILES["database"])
     fail_counts = defaultdict(int, safe_json(FILES["fail_count"]))
 
     while True:
         try:
             cfg = safe_json(FILES["config"], DEFAULT_CONFIG.copy())
             now = time.time()
-            is_full_scan = now - time.time() % 300 < 10  # 约5分钟一次全扫
+            is_full_scan = (now - time.time() % 300) < 10
 
             targets = []
             if is_full_scan:
@@ -225,23 +233,26 @@ def evolution_engine():
 
             blacklist = IPPoolManager.get_blacklist()
             seen = set()
-            unique_targets = [t for t in targets if t["ip"] not in blacklist and t["ip"] not in seen and not seen.add(t["ip"])]
-
+            unique_targets = []
+            for t in targets:
+                ip = t["ip"]
+                if ip in blacklist or ip in seen:
+                    continue
+                seen.add(ip)
+                unique_targets.append(t)
             random.shuffle(unique_targets)
 
             results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["max_workers"]) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["max_workers"]) as executor:
                 def test_ip(task):
                     ip = task["ip"]
                     try:
-                        # TCP ping
                         with socket.socket() as s:
                             s.settimeout(cfg["connect_timeout"])
                             t1 = time.perf_counter()
                             s.connect((ip, cfg["port"]))
                             tcp_ms = (time.perf_counter() - t1) * 1000
 
-                        # 下载测速
                         bytes_test = cfg["test_bytes_by_mode"].get(cfg["mode"], 200000)
                         speed = 0.0
                         try:
@@ -253,12 +264,12 @@ def evolution_engine():
                                 stream=True
                             )
                             size = 0
-                            for chunk in r.iter_content(128*1024):
+                            for chunk in r.iter_content(128 * 1024):
                                 size += len(chunk)
                                 if time.perf_counter() - st > cfg["download_timeout"]:
                                     break
                             speed = size / (time.perf_counter() - st) / 1024 / 1024
-                        except:
+                        except Exception:
                             pass
 
                         geo = get_geo_info(ip)
@@ -276,8 +287,8 @@ def evolution_engine():
                             "last_test": datetime.now().strftime("%H:%M:%S")
                         }
 
-                        old = db.get(ip, {})
-                        if score >= old.get("score", 0) - 5:
+                        old_score = db.get(ip, {}).get("score", 0)
+                        if score >= old_score - 5:
                             db[ip] = result
                             fail_counts[ip] = 0
                         else:
@@ -287,14 +298,13 @@ def evolution_engine():
                                 logger.info(f"IP {ip} 连续失败3次，已加入黑名单")
 
                         return result
-
                     except Exception:
                         fail_counts[ip] += 1
                         if fail_counts[ip] >= 3:
                             IPPoolManager.add_to_blacklist(ip)
                         return None
 
-                futures = [ex.submit(test_ip, t) for t in unique_targets[:180]]
+                futures = [executor.submit(test_ip, t) for t in unique_targets[:180]]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res:
@@ -305,12 +315,11 @@ def evolution_engine():
                 safe_write_json(FILES["results"], {
                     "last_run": datetime.now().strftime("%H:%M:%S"),
                     "winner": sorted_results[0] if sorted_results else None,
-                    "table": sorted_results[:80],  # 显示前80条
+                    "table": sorted_results[:80],
                     "is_full": is_full_scan,
                     "mode": cfg["mode"]
                 })
 
-            # 补充池子
             if random.random() < 0.4:
                 threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
                 threading.Thread(target=IPPoolManager.fill_niche_pool).start()
@@ -319,18 +328,16 @@ def evolution_engine():
             safe_write_json(FILES["fail_count"], dict(fail_counts))
 
         except Exception as e:
-            logger.error(f"引擎异常: {e}")
+            logger.error(f"进化引擎异常: {e}")
 
         time.sleep(6)
 
-# 启动
-if "started" not in st.session_state:
+# 启动后台线程
+if "evolution_started" not in st.session_state:
     threading.Thread(target=evolution_engine, daemon=True).start()
-    st.session_state.started = True
+    st.session_state.evolution_started = True
 
-# ==============================
-#          前端界面
-# ==============================
+# Streamlit 界面
 st.set_page_config(page_title="Cloudflare 猎手 · 进化版", page_icon="🧬", layout="wide")
 
 with st.sidebar:
@@ -338,37 +345,41 @@ with st.sidebar:
     cfg = safe_json(FILES["config"], DEFAULT_CONFIG.copy())
 
     modes = list(DEFAULT_CONFIG["test_bytes_by_mode"].keys())
-    idx = modes.index(cfg["mode"]) if cfg["mode"] in modes else 0
-    new_mode = st.radio("策略", modes, index=idx)
+    mode_idx = modes.index(cfg["mode"]) if cfg["mode"] in modes else 0
+    new_mode = st.radio("优选策略", modes, index=mode_idx)
 
     with st.expander("高级设置"):
-        host = st.text_input("Host", cfg["host"])
+        host = st.text_input("伪装域名", value=cfg["host"])
         port = st.number_input("端口", value=cfg["port"])
-        max_workers = st.slider("最大并发", 10, 120, cfg["max_workers"])
+        max_workers = st.slider("最大并发数", 10, 120, cfg["max_workers"], step=5)
 
-    if st.button("保存并重启", type="primary"):
+    if st.button("保存配置并重启", type="primary"):
         new_cfg = cfg.copy()
-        new_cfg.update({"mode": new_mode, "host": host, "port": port, "max_workers": max_workers})
+        new_cfg.update({
+            "mode": new_mode,
+            "host": host,
+            "port": port,
+            "max_workers": max_workers
+        })
         safe_write_json(FILES["config"], new_cfg)
         if FILES["results"].exists():
             FILES["results"].unlink()
-        st.success("已保存，引擎重启...")
+        st.success("配置已保存，引擎即将重启...")
         time.sleep(1.2)
         st.rerun()
 
-# 主界面
 data = safe_json(FILES["results"])
 
 if not data or not data.get("winner"):
     st.title("🧬 Cloudflare 猎手 · 进化版")
-    st.info("引擎启动中... 预计10~40秒完成首次扫描")
+    st.info("正在启动进化引擎... 初次扫描预计 10~40 秒")
     time.sleep(5)
     st.rerun()
 else:
     winner = data["winner"]
     st.title("🧬 Cloudflare 猎手 · 进化版")
 
-    tag = "🚀 全量扫描" if data.get("is_full") else "⚡ 实时优化"
+    tag = "🚀 全量扫描中" if data.get("is_full") else "⚡ 实时优化"
     st.markdown(f"### 当前最强节点：`{winner['ip']}`　　{tag}")
 
     cols = st.columns([2.5, 1.2, 1.2, 1.5])
@@ -379,7 +390,7 @@ else:
 
     st.divider()
 
-    st.subheader(f"实时排行榜（策略：{data['mode']}） - 前 {len(data['table'])} 名")
+    st.subheader(f"实时排行榜（当前策略：{data['mode']}） 前 {len(data['table'])} 名")
 
     df = pd.DataFrame(data["table"])
     df["来源"] = df["src"]
@@ -397,7 +408,7 @@ else:
         hide_index=True
     )
 
-    st.caption(f"最后更新: {data['last_run']}　｜　每5分钟全量扫描一次")
+    st.caption(f"最后更新: {data['last_run']}　｜　每5分钟进行一次全量扫描")
 
     time.sleep(5)
     st.rerun()
