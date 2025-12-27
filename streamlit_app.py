@@ -39,16 +39,16 @@ DEFAULT_CONFIG = {
     "port": 443,
     "uuid": "",
     "ws_path": "/",
-    "max_workers": 30,  # 整体降低，避免卡
-    "initial_workers": 12,  # 启动时先用小并发快速出结果
-    "connect_timeout": 1.5,
-    "download_timeout": 5.0,
+    "max_workers": 25,
+    "initial_workers": 8,
+    "connect_timeout": 2.0,
+    "download_timeout": 6.0,
     "geo_cache_hours": 6,
     "test_bytes_by_mode": {
-        "☀️ 正常使用排位": 100_000,
-        "⚡ 极速低延迟": 50_000,
-        "🤖 GPT 独享专线": 150_000,
-        "🎬 流媒体解锁专线": 300_000,
+        "☀️ 正常使用排位": 50_000,
+        "⚡ 极速低延迟": 30_000,
+        "🤖 GPT 独享专线": 100_000,
+        "🎬 流媒体解锁专线": 200_000,
     }
 }
 
@@ -62,7 +62,6 @@ GOLDEN_SUBNETS = [
 QUICK_SEEDS = [
     "104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1",
     "104.18.20.126", "172.64.155.1", "104.16.123.96", "172.67.69.1",
-    "104.17.0.1", "172.65.1.1", "104.20.1.1", "172.68.1.1",
     "2a09:bac6:d69c:15f::23:4668"  # 新加坡 IPv6
 ]
 
@@ -92,7 +91,7 @@ def safe_write_json(file_path: Path, data):
     except Exception as e:
         logger.error(f"写入失败 {file_path}: {e}")
 
-def get_geo_info(ip: str, timeout=3.0) -> dict:
+def get_geo_info(ip: str, timeout=3.5) -> dict:
     now = time.time()
     if ip in geo_cache and geo_cache[ip]["expire"] > now:
         return geo_cache[ip]["data"]
@@ -146,7 +145,7 @@ class IPPoolManager:
         blacklist = IPPoolManager.get_blacklist()
         for url in sources:
             try:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, timeout=12)
                 ips = re.findall(r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)', r.text)
                 for ip in ips:
                     if ip not in blacklist and ip not in found:
@@ -180,12 +179,6 @@ def evolution_engine():
     db = safe_json(FILES["database"])
     fail_counts = defaultdict(int, safe_json(FILES["fail_count"]))
 
-    # 启动时先同步填充池子（关键优化：保证有种子）
-    logger.info("启动时同步填充爬虫和冷门池...")
-    IPPoolManager.fill_crawler_pool()
-    IPPoolManager.fill_niche_pool()
-
-    # 第一次扫描只用低并发快速出结果
     first_scan_done = False
 
     while True:
@@ -195,13 +188,17 @@ def evolution_engine():
             is_full_scan = (now - time.time() % 300) < 10
 
             targets = []
-            # 优先使用历史数据库（按 score 降序择优）
+            # 优先历史数据库（择优）
             if db:
-                sorted_db = sorted(db.items(), key=lambda x: x[1].get('score', 0), reverse=True)[:100]
+                sorted_db = sorted(db.items(), key=lambda x: x[1].get('score', 0), reverse=True)[:80]
                 targets.extend({"ip": ip, "src": "🏆 历史优选"} for ip, _ in sorted_db)
-            # 再加 QUICK_SEEDS
             targets.extend({"ip": ip, "src": "⚡ 优质种子"} for ip in QUICK_SEEDS)
-            # 爬虫和冷门
+
+            # 异步填充池子
+            if random.random() < 0.6:
+                threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
+                threading.Thread(target=IPPoolManager.fill_niche_pool).start()
+
             targets.extend({"ip": ip, "src": "🕷️ 爬虫"} for ip in safe_json(FILES["crawlers"], []))
             targets.extend({"ip": ip, "src": "💎 冷门"} for ip in safe_json(FILES["niches"], []))
 
@@ -210,7 +207,6 @@ def evolution_engine():
             unique_targets = [t for t in targets if t["ip"] not in blacklist and t["ip"] not in seen and not seen.add(t["ip"])]
             random.shuffle(unique_targets)
 
-            # 第一次扫描用小并发，快速出结果
             workers = cfg["initial_workers"] if not first_scan_done else cfg["max_workers"]
 
             results = []
@@ -226,7 +222,7 @@ def evolution_engine():
                             s.connect((ip, cfg["port"]))
                             tcp_ms = (time.perf_counter() - t1) * 1000
 
-                        bytes_test = cfg["test_bytes_by_mode"].get(cfg["mode"], 100000)
+                        bytes_test = cfg["test_bytes_by_mode"].get(cfg["mode"], 50000)
                         speed = 0.0
                         try:
                             st = time.perf_counter()
@@ -235,7 +231,7 @@ def evolution_engine():
                                             timeout=cfg["download_timeout"],
                                             stream=True)
                             size = 0
-                            for chunk in r.iter_content(128 * 1024):
+                            for chunk in r.iter_content(64 * 1024):
                                 size += len(chunk)
                                 if time.perf_counter() - st > cfg["download_timeout"]:
                                     break
@@ -276,7 +272,7 @@ def evolution_engine():
                             IPPoolManager.add_to_blacklist(ip)
                         return None
 
-                futures = [executor.submit(test_ip, t) for t in unique_targets[:300]]
+                futures = [executor.submit(test_ip, t) for t in unique_targets[:200]]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res:
@@ -293,15 +289,9 @@ def evolution_engine():
                     "debug": {"targets": len(unique_targets), "success": success_count}
                 })
 
-                # 第一轮完成后，标记已完成，后续用全并发
                 if not first_scan_done:
                     first_scan_done = True
-                    logger.info("第一轮快速扫描完成，后续切换全并发")
-
-            # 异步填充（降低冲突）
-            if random.random() < 0.6:
-                threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
-                threading.Thread(target=IPPoolManager.fill_niche_pool).start()
+                    logger.info("第一轮快速扫描完成，后续全并发")
 
             safe_write_json(FILES["database"], db)
             safe_write_json(FILES["fail_count"], dict(fail_counts))
@@ -309,7 +299,7 @@ def evolution_engine():
         except Exception as e:
             logger.error(f"引擎异常: {e}")
 
-        time.sleep(5)
+        time.sleep(4)
 
 if "started" not in st.session_state:
     threading.Thread(target=evolution_engine, daemon=True).start()
@@ -327,7 +317,7 @@ with st.sidebar:
     with st.expander("高级设置"):
         host = st.text_input("伪装域名", value=cfg["host"])
         port = st.number_input("端口", value=cfg["port"])
-        max_workers = st.slider("最大并发", 10, 80, cfg["max_workers"], step=5)
+        max_workers = st.slider("最大并发", 10, 60, cfg["max_workers"], step=5)
 
     if st.button("保存并重启", type="primary"):
         new_cfg = cfg.copy()
@@ -343,7 +333,7 @@ data = safe_json(FILES["results"])
 
 if not data or not data.get("winner"):
     st.title("🧬 Cloudflare 猎手 · 进化版")
-    st.info("引擎启动中... 预计5~20秒初次扫描完成（优先本地历史IP）")
+    st.info("引擎启动中... 预计5~15秒初次扫描完成（优先本地历史IP）")
     time.sleep(3)
     st.rerun()
 
