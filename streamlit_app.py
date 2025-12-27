@@ -9,29 +9,32 @@ import concurrent.futures
 import statistics
 import socket
 from datetime import datetime
+import urllib3
+
+# 禁用 HTTPS 证书警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置 (电信深蓝主题 + 分区支持)
+# 1. 页面配置
 # ===========================
-st.set_page_config(page_title="VLESS 终极融合版", page_icon="💎", layout="wide")
+st.set_page_config(page_title="VLESS 竞速排位版", page_icon="🏎️", layout="wide")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #001f3f; color: #E0E0E0; } /* 电信深蓝 */
+    .stApp { background-color: #001f3f; color: #E0E0E0; }
     div[data-testid="column"] { background-color: #003366; border: 1px solid #0074D9; border-radius: 8px; padding: 15px; }
-    
-    /* 调整 Tab 样式，使其在深色背景下更明显 */
     button[data-baseweb="tab"] { font-size: 16px; font-weight: bold; color: #7FDBFF; }
     div[data-testid="stMetricValue"] { color: #2ECC40 !important; }
-    h1, h2, h3 { color: #ffffff !important; }
     
-    /* 进度条 */
-    .stProgress > div > div > div > div { background-color: #39CCCC; }
+    /* 来源标签颜色 */
+    .source-local { color: #FF851B; font-weight: bold; }
+    .source-saved { color: #2ECC40; font-weight: bold; }
+    .source-cloud { color: #7FDBFF; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
 # ===========================
-# 2. 核心配置
+# 2. 配置与文件
 # ===========================
 try:
     CF_CONFIG = {
@@ -43,131 +46,189 @@ except:
     st.error("❌ 配置缺失！请检查 secrets.toml")
     st.stop()
 
-DB_FILE = "ultimate_history.log"
+DB_FILE = "racing_history.log"
+SAVED_IP_FILE = "good_ips.txt" # 💾 精英节点库
 
 # ===========================
-# 3. 基础工具 (地理位置 + IP池)
+# 3. 核心工具函数
 # ===========================
 
 @st.cache_data(ttl=3600)
 def get_ip_info(ip):
-    """查询 IP 地理位置 (用于分区)"""
     try:
         url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
         r = requests.get(url, timeout=2).json()
         cc = r.get("countryCode", "UNK")
-        if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG', 'MY', 'VN']: return "🌏 亚洲", r.get("country")
-        if cc in ['US', 'CA', 'MX', 'BR']: return "🇺🇸 美洲", r.get("country")
-        if cc in ['DE', 'GB', 'FR', 'NL', 'RU', 'EU']: return "🇪🇺 欧洲", r.get("country")
+        if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG']: return "🌏 亚洲", r.get("country")
+        if cc in ['US', 'CA', 'MX']: return "🇺🇸 美洲", r.get("country")
+        if cc in ['DE', 'GB', 'FR', 'NL', 'RU']: return "🇪🇺 欧洲", r.get("country")
         return "🌍 其他", r.get("country")
+    except: return "🛸 未知", "Unknown"
+
+def tcp_ping(ip, port=443):
+    """Ping0: 纯 TCP 握手延迟测试 (不带SSL)"""
+    try:
+        start = time.time()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0) # 1秒超时，快速筛选
+        s.connect((ip, port))
+        s.close()
+        return int((time.time() - start) * 1000)
     except:
-        return "🛸 未知", "Unknown"
+        return 9999
 
-def resolve_commercial_domains():
-    """解析商业域名获取高质量 IP"""
-    domains = ["www.discord.com", "www.udemy.com", "www.digitalocean.com", "cdn.shopify.com"]
-    ips = set()
-    for d in domains:
-        try:
-            # 获取 443 端口的 A 记录
-            infos = socket.getaddrinfo(d, 443, proto=socket.IPPROTO_TCP)
-            for i in infos: ips.add(i[4][0])
-        except: pass
-    return list(ips)
+def load_saved_ips():
+    """读取已保存的精英 IP"""
+    if not os.path.exists(SAVED_IP_FILE): return []
+    with open(SAVED_IP_FILE, "r") as f:
+        content = f.read()
+        return list(set(re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', content)))
 
-def get_ultimate_pool():
-    """构建终极 IP 池 (官方电信段 + 商业 + 爬虫)"""
-    pool = set()
-    
-    # 1. 官方电信优选段 (104.16-20 / 172.64-67)
-    official_ips = []
-    for _ in range(15): official_ips.append(f"104.{random.randint(16, 20)}.{random.randint(0, 255)}.{random.randint(0, 255)}")
-    for _ in range(15): official_ips.append(f"172.{random.randint(64, 67)}.{random.randint(0, 255)}.{random.randint(0, 255)}")
-    for ip in official_ips: pool.add(ip)
-
-    # 2. 商业解析
-    comm_ips = resolve_commercial_domains()
-    for ip in comm_ips: pool.add(ip)
-
-    # 3. 爬虫采集
-    urls = [
-        "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt",
-        "https://www.cloudflare.com/ips-v4"
-    ]
-    def fetch(url):
-        try:
-            return re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', requests.get(url, timeout=3).text)
-        except: return []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        for res in ex.map(fetch, urls):
-            for ip in res: pool.add(ip)
+def save_good_ip(ip):
+    """保存表现好的 IP 到本地文件"""
+    existing = load_saved_ips()
+    if ip not in existing:
+        with open(SAVED_IP_FILE, "a") as f:
+            f.write(f"{ip}\n")
             
-    # 随机采样，防止数量过多导致卡顿，保留 80 个
-    final_list = list(pool)
-    return random.sample(final_list, min(len(final_list), 80))
+def get_competitor_pool():
+    """构建竞技场选手池 (不分贵贱，只标记来源)"""
+    competitors = []
+    seen_ips = set()
+    
+    # 1. 本地种子选手 (Local)
+    locals = ["108.162.194.1", "172.64.32.12", "162.159.61.1"]
+    for ip in locals:
+        competitors.append({"ip": ip, "source": "🏠 本地"})
+        seen_ips.add(ip)
+        
+    # 2. 历史精英选手 (Saved)
+    saved = load_saved_ips()
+    for ip in saved:
+        if ip not in seen_ips:
+            competitors.append({"ip": ip, "source": "💾 历史"})
+            seen_ips.add(ip)
+            
+    # 3. 网络海选选手 (Scraped)
+    # 我们希望海选选手多一点，给它们逆袭的机会
+    target_total = 80 # 总参赛人数
+    needed = target_total - len(competitors)
+    
+    if needed > 0:
+        urls = [
+            "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt", 
+            "https://www.cloudflare.com/ips-v4"
+        ]
+        scraped_pool = set()
+        
+        def fetch(url):
+            try: return re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', requests.get(url, timeout=3).text)
+            except: return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            for res in ex.map(fetch, urls):
+                for ip in res: scraped_pool.add(ip)
+        
+        scraped_list = list(scraped_pool)
+        # 随机抽取填满名额
+        if scraped_list:
+            picked = random.sample(scraped_list, min(len(scraped_list), needed))
+            for ip in picked:
+                if ip not in seen_ips:
+                    competitors.append({"ip": ip, "source": "☁️ 爬虫"})
+    
+    return competitors
 
 # ===========================
-# 4. 电信评分算法 & 测试逻辑
+# 4. 深度评测 (绝对公平版)
 # ===========================
 
-def calculate_telecom_score(lat, jitter, loss, speed):
-    """电信评分算法：严打丢包抖动"""
+def calculate_fair_score(tcp_lat, http_lat, jitter, loss, speed):
+    """
+    公平评分公式：无任何来源加成！
+    完全由网络指标决定分数。
+    """
     score = 100
-    score += min(speed * 3, 30)       # 速度加分
-    if lat > 150: score -= (lat - 150) / 4 # 延迟扣分
-    score -= jitter * 3               # 抖动重罚
-    if loss > 0:                      # 丢包重罚
-        score -= 50
-        score -= loss * 2
+    
+    # 1. 速度权重 (最高 +60分) - 鼓励大带宽
+    score += min(speed * 3, 60)
+    
+    # 2. 延迟权重 (TCP与HTTP加权平均)
+    # 延迟越低越好，超过 150ms 开始扣分
+    lat_metric = (tcp_lat * 0.4) + (http_lat * 0.6)
+    if lat_metric > 150:
+        score -= (lat_metric - 150) / 3
+        
+    # 3. 稳定性权重 (抖动)
+    score -= jitter * 1.5
+    
+    # 4. 丢包权重 (重罚)
+    if loss > 0:
+        score -= loss * 2.5
+        score -= 20 # 只要丢包直接扣20基础分
+        
     return round(score, 1)
 
-def deep_test_node(node_data):
-    ip = node_data['ip']
-    source_type = "☁️ 采集"
-    if ip.startswith("104.") or ip.startswith("172."): source_type = "⭐ 官方"
-    if ip in node_data.get('commercial', []): source_type = "💎 商业"
+def deep_test_node(node):
+    ip = node['ip']
+    
+    # 1. Ping0 (TCP)
+    tcp_lat = tcp_ping(ip)
+    if tcp_lat > 2000: return None # 连通性太差直接淘汰
 
-    # 1. 稳定性测试 (HTTPS Ping 5次)
+    # 2. HTTP/HTTPS Latency
     delays = []
-    loss_count = 0
-    try:
-        for _ in range(5):
+    success_count = 0
+    
+    # 测 3 次
+    for _ in range(3):
+        try:
             s = time.time()
             requests.head(f"https://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.5, verify=False)
             delays.append((time.time() - s) * 1000)
-    except:
-        loss_count += 1 # 捕获异常算一次丢包，但不中断循环太复杂，这里简化
-        
-    # 如果 delays 为空，说明全丢
-    if not delays:
-        return None 
+            success_count += 1
+        except: pass
 
-    # 补充丢包计算 (如果5次里有失败的)
-    real_loss_count = 5 - len(delays)
-    loss_rate = (real_loss_count / 5) * 100
-    
-    avg_lat = statistics.mean(delays)
+    # 补救措施：如果HTTPS全挂，试一次HTTP
+    if not delays:
+        try:
+            s = time.time()
+            requests.head(f"http://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.5)
+            delays.append((time.time() - s) * 1000)
+            http_lat = delays[0]
+        except: return None # 彻底没救
+    else:
+        http_lat = statistics.mean(delays)
+
+    loss_rate = ((3 - success_count) / 3) * 100
     jitter = statistics.stdev(delays) if len(delays) > 1 else 0
-    
-    # 2. 获取区域 (为了分区!)
     region, country = get_ip_info(ip)
 
-    # 3. 速度测试 (下载)
+    # 3. 速度测试 (1MB)
     speed_mb = 0.0
     try:
         s_time = time.time()
-        r = requests.get(f"https://{ip}/__down?bytes=1500000", headers={"Host": "speed.cloudflare.com"}, timeout=5, verify=False)
+        r = requests.get(f"http://{ip}/__down?bytes=1000000", headers={"Host": "speed.cloudflare.com"}, timeout=4)
         if r.status_code == 200:
             speed_mb = (len(r.content)/1024/1024) / (time.time() - s_time)
     except: pass
 
-    # 4. 评分
-    score = calculate_telecom_score(avg_lat, jitter, loss_rate, speed_mb)
+    # 4. 评分 (无偏见)
+    score = calculate_fair_score(tcp_lat, http_lat, jitter, loss_rate, speed_mb)
+    
+    # === 关键逻辑：优胜劣汰保存 ===
+    # 只有来源是爬虫，且分数极高 (>80)，才保存
+    # 这样能保证本地库里都是精品
+    is_new_discovery = False
+    if score > 80 and node['source'] == "☁️ 爬虫":
+        save_good_ip(ip)
+        is_new_discovery = True
 
     return {
-        "ip": ip, "region": region, "country": country, "source": source_type,
-        "lat": int(avg_lat), "jitter": int(jitter), "loss": int(loss_rate),
+        "ip": ip, "region": region, "country": country, 
+        "source": node['source'], "is_new": is_new_discovery,
+        "tcp": int(tcp_lat), "http": int(http_lat), 
+        "jitter": int(jitter), "loss": int(loss_rate), 
         "speed": round(speed_mb, 2), "score": score
     }
 
@@ -190,22 +251,23 @@ def sync_dns(ip):
 # 5. 主界面
 # ===========================
 
-st.title("💎 VLESS 终极融合版")
+st.title("🏎️ VLESS 竞速排位版")
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.info("💡 融合内核：电信QoS评分算法 + 全球分区 + 多源爬虫 + 深度体检")
-with col2:
-    start = st.button("🚀 开始全面扫描", type="primary", use_container_width=True)
+c1, c2, c3 = st.columns([2, 1, 1])
+with c1:
+    st.info("💡 机制：完全按质量评分 (无来源加成) + 自动保存优选爬虫节点 + Ping0显示")
+with c2:
+    if st.button("🗑️ 清空精英库"):
+        if os.path.exists(SAVED_IP_FILE): os.remove(SAVED_IP_FILE)
+        st.toast("已清空保存列表")
+with c3:
+    start = st.button("🚀 开始排位赛", type="primary", use_container_width=True)
 
 if start:
-    with st.spinner("📦 正在聚合资源：官方段 + 商业域名 + GitHub 源..."):
-        scan_list = get_ultimate_pool()
-        # 标记商业IP用于识别
-        comm_list = resolve_commercial_domains()
-        tasks = [{"ip": ip, "commercial": comm_list} for ip in scan_list]
+    with st.spinner("🏟️ 选手入场：集结本地、历史、爬虫节点..."):
+        tasks = get_competitor_pool()
         
-    st.write(f"⚡ 正在对 {len(tasks)} 个节点进行深度分层测试...")
+    st.write(f"⚡ 正在对 {len(tasks)} 个节点进行公平竞技...")
     progress = st.progress(0)
     
     results = []
@@ -214,62 +276,74 @@ if start:
         for i, fut in enumerate(concurrent.futures.as_completed(futs)):
             progress.progress((i + 1) / len(tasks))
             res = fut.result()
-            # 过滤掉极差的节点 (延迟>1000 或 负分太严重)
-            if res and res['lat'] < 1000 and res['score'] > -200:
-                results.append(res)
-                
+            if res: results.append(res)
+            
     if results:
+        # === 核心逻辑：完全按分数倒序 ===
         results.sort(key=lambda x: x['score'], reverse=True)
         winner = results[0]
-        msg = sync_dns(winner['ip'])
         
-        # --- 冠军展示 ---
-        st.success(f"🏆 综合最优: {winner['ip']} ({winner['region']} - {winner['country']})")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("综合评分", winner['score'], winner['source'])
-        c2.metric("下载速度", f"{winner['speed']} MB/s")
-        c3.metric("延迟/抖动", f"{winner['lat']} ms", f"±{winner['jitter']}")
-        c4.write(f"📝 {msg}")
+        # 如果冠军是爬虫，说明爬虫逆袭了！
+        win_source = winner['source']
+        if winner.get('is_new'):
+            win_source += " (✨新晋精英)"
         
+        sync_msg = sync_dns(winner['ip'])
+        
+        # 冠军展示
+        st.success(f"🏆 冠军节点: {winner['ip']} | 来源: {win_source}")
+        
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("综合得分", winner['score'], "质量优先")
+        k2.metric("Ping0 (TCP)", f"{winner['tcp']} ms", "物理延迟")
+        k3.metric("下载速度", f"{winner['speed']} MB/s")
+        k4.metric("丢包率", f"{winner['loss']}%", f"抖动 {winner['jitter']}")
+        
+        st.caption(f"📝 {sync_msg}")
         st.divider()
-        
-        # --- 分区展示 (Tab 回归!) ---
+
+        # 表格展示
         df = pd.DataFrame(results)
-        # 整理列名
+        
+        # 标记新保存的节点
+        df['source'] = df.apply(lambda x: x['source'] + " ✨" if x.get('is_new') else x['source'], axis=1)
+
         display_cols = {
-            "score": "评分", "ip": "IP 地址", "source": "来源", "speed": "速度(MB/s)",
-            "lat": "延迟", "jitter": "抖动", "loss": "丢包(%)", "country": "国家"
+            "score": "评分", "ip": "IP", "source": "来源", "tcp": "Ping0(ms)", 
+            "http": "HTTP(ms)", "speed": "速度(MB/s)", "loss": "丢包(%)", "country": "国家"
         }
         
-        # 定义展示函数
-        def show_tab_table(data):
-            if data.empty:
-                st.warning("⚠️ 该区域暂无符合条件的优质节点")
+        for k in display_cols.keys(): 
+            if k not in df.columns: df[k] = 0
+
+        def show_table(data):
+            if data.empty: st.warning("无数据")
             else:
                 st.dataframe(
                     data.rename(columns=display_cols)[display_cols.values()],
                     use_container_width=True,
                     hide_index=True,
                     column_config={
-                        "评分": st.column_config.ProgressColumn(format="%.1f", min_value=-100, max_value=150),
+                        "评分": st.column_config.ProgressColumn(format="%.1f", min_value=-50, max_value=120),
+                        "Ping0(ms)": st.column_config.NumberColumn(format="%d ms"),
                     }
                 )
 
-        t_all, t_asia, t_amer, t_euro = st.tabs(["🌐 全部榜单", "🌏 亚洲专区", "🇺🇸 美洲专区", "🇪🇺 欧洲专区"])
-        
-        with t_all: show_tab_table(df)
-        with t_asia: show_tab_table(df[df['region'] == "🌏 亚洲"])
-        with t_amer: show_tab_table(df[df['region'] == "🇺🇸 美洲"])
-        with t_euro: show_tab_table(df[df['region'] == "🇪🇺 欧洲"])
+        t1, t2, t3, t4 = st.tabs(["🌐 总榜单", "🌏 亚洲赛区", "🇺🇸 美洲赛区", "🇪🇺 欧洲赛区"])
+        with t1: 
+            st.caption(f"本次排位赛共 {len(results)} 位选手完赛。新发现的优质爬虫节点已自动保存。")
+            show_table(df)
+        with t2: show_table(df[df['region'] == "🌏 亚洲"])
+        with t3: show_table(df[df['region'] == "🇺🇸 美洲"])
+        with t4: show_table(df[df['region'] == "🇪🇺 欧洲"])
         
         # 记录日志
         with open(DB_FILE, "a") as f:
-            f.write(f"{datetime.now().strftime('%m-%d %H:%M')} | {winner['ip']} | {winner['score']} | {winner['region']}\n")
-            
-    else:
-        st.error("❌ 未找到可用节点，请检查网络连通性。")
+            f.write(f"{datetime.now().strftime('%H:%M')} | {winner['ip']} | TCP:{winner['tcp']} | {winner['source']}\n")
 
-# 历史
-with st.expander("📜 扫描历史"):
+    else:
+        st.error("❌ 全员淘汰，无可用节点。")
+
+with st.expander("📜 历史战绩"):
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f: st.text("".join(f.readlines()[-5:]))
