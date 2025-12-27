@@ -18,7 +18,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 基础配置与路径
+# 1. 基础配置与文件 IO
 # ===========================
 st.set_page_config(page_title="Cloudflare 猎手进化版", page_icon="🧬", layout="wide")
 
@@ -31,8 +31,8 @@ CONFIG_FILE = "app_config.json"
 QUICK_SEEDS = ["104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1"]
 GOLDEN_SUBNETS = ["104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", "172.64.0.0/13"]
 
-# 文件安全读写工具
 def safe_write_json(path, data):
+    """原子化写入：先写临时文件再替换，防止前端读取冲突"""
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding='utf-8') as f:
@@ -61,7 +61,7 @@ class PoolManager:
     @staticmethod
     def fill_crawler():
         ips = safe_read_json(CRAWLER_FILE, [])
-        if len(ips) >= 25: return # 略微扩容以应对全量扫描
+        if len(ips) >= 25: return 
         try:
             r = requests.get("https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt", timeout=3)
             found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', r.text)
@@ -86,12 +86,12 @@ class PoolManager:
         safe_write_json(NICHE_FILE, ips)
 
 # ===========================
-# 3. 独立进化引擎 (5分钟全量扫描核心)
+# 3. 独立进化引擎 (5分钟全量普查+自动更换)
 # ===========================
 
 def background_evolution():
     start_time = time.time()
-    last_full_scan = 0 # 记录上一次5分钟全量扫描时间
+    last_full_scan = 0 
     db_data = safe_read_json(DB_FILE, {})
     
     while True:
@@ -99,28 +99,27 @@ def background_evolution():
             now = time.time()
             cfg = safe_read_json(CONFIG_FILE, {"mode": "☀️ 正常使用排位", "host": "speed.cloudflare.com", "port": 443})
             
-            # --- 阶段 A: 判断是否触发 5 分钟全量扫描 ---
-            is_full_scan = (now - last_full_scan >= 300) 
+            # --- 阶段 A: 判断扫描深度 ---
+            is_full_scan = (now - last_full_scan >= 300) # 5分钟全量普查
             
             # --- 阶段 B: 目标收集 ---
             targets = []
             if is_full_scan:
-                # 全量扫描：测试所有历史、爬虫和本地数据
-                all_history = list(db_data.values())
-                targets += [{"ip": i['ip'], "src": "📂 基因普查"} for i in all_history]
+                # 全量测试所有数据
+                targets += [{"ip": i['ip'], "src": "📂 基因普查"} for i in db_data.values()]
                 targets += [{"ip": ip, "src": "🕷️ 爬虫全检"} for ip in safe_read_json(CRAWLER_FILE, [])]
                 targets += [{"ip": ip, "src": "💎 冷门全检"} for ip in safe_read_json(NICHE_FILE, [])]
                 last_full_scan = now
             else:
-                # 常规扫描：极速轮询
+                # 常规极速轮询
                 top_20 = sorted(db_data.values(), key=lambda x: x.get('score', 0), reverse=True)[:20]
                 targets += [{"ip": ip, "src": "⚡ 本地种子"} for ip in QUICK_SEEDS]
                 targets += [{"ip": i['ip'], "src": "📂 历史优选"} for i in top_20]
                 targets += [{"ip": ip, "src": "🕷️ 爬虫发现"} for ip in safe_read_json(CRAWLER_FILE, [])[:10]]
 
-            # --- 阶段 C: 极速并发测试 (自动更换逻辑) ---
+            # --- 阶段 C: 并发测试与质量自动更换 ---
             current_results = []
-            workers = 40 if is_full_scan else 20 # 全量扫描时加大并发
+            workers = 40 if is_full_scan else 20 
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
                 def test_task(t):
@@ -138,12 +137,12 @@ def background_evolution():
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    # 自动评分与质量更换
+                    # 评分与更换
                     score = round(100 - p_avg/5 + min(speed*5, 35), 1)
                     res = {"ip": ip, "score": score, "avg": p_avg, "speed": round(speed, 2), 
                            "src": t['src'], "last_test": datetime.now().strftime("%H:%M:%S")}
                     
-                    # 【自动更换】若新评分更高，则立即覆盖精英库数据
+                    # 自动更换比当前更好的节点
                     if score >= db_data.get(ip, {}).get('score', 0): db_data[ip] = res
                     return res
 
@@ -160,20 +159,18 @@ def background_evolution():
                             "is_full": is_full_scan
                         })
 
-            # 周期性补充爬虫数据
             PoolManager.trigger_fill()
             safe_write_json(DB_FILE, db_data)
             
         except: pass
-        time.sleep(10 if not is_full_scan else 30) # 全量扫描后多休息一会儿
+        time.sleep(10)
 
-# 启动后台引擎
 if "evolution_engine" not in st.session_state:
     threading.Thread(target=background_evolution, daemon=True).start()
     st.session_state.evolution_engine = True
 
 # ===========================
-# 4. 前端展示 (可视化全量扫描状态)
+# 4. 前端展示 (找回侧边栏+可视化)
 # ===========================
 
 with st.sidebar:
@@ -185,6 +182,7 @@ with st.sidebar:
     if st.button("💾 保存配置并应用"):
         safe_write_json(CONFIG_FILE, {"mode": new_mode, "host": cfg['host'], "port": cfg['port']})
         st.toast(f"✅ 策略已更新: {new_mode}")
+        if os.path.exists(RESULT_FILE): os.remove(RESULT_FILE)
         time.sleep(0.5); st.rerun()
 
 st.title("🧬 Cloudflare 猎手进化版")
@@ -192,7 +190,6 @@ data = safe_read_json(RESULT_FILE, None)
 
 if data:
     w = data['winner']
-    # 动态显示扫描模式
     scan_tag = "🚀 全量普查中" if data.get('is_full') else "📡 实时监测中"
     st.markdown(f"### 🏆 当前最强 IP: `{w['ip']}` | 状态: `{scan_tag}`")
     
@@ -206,8 +203,8 @@ if data:
         },
         use_container_width=True, hide_index=True
     )
-    st.caption(f"上次演化更新: {data['last_run']} | 每 5 分钟执行一次全量数据普查与自动更换")
+    st.caption(f"上次更新: {data['last_run']} | 每 5 分钟全量扫描并自动更换更优节点")
     time.sleep(5); st.rerun()
 else:
-    st.info("🚀 正在激活三级跳引擎... 首次加载约需 10 秒。")
+    st.info("🚀 正在激活后台进化引擎... 程序已在系统后台持续运行。")
     time.sleep(2); st.rerun()
