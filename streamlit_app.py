@@ -17,27 +17,35 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 核心配置定义 (确保前后端一致)
+# 1. 核心配置与极速种子
 # ===========================
-st.set_page_config(page_title="VLESS 四川电信 GPT版", page_icon="🐼", layout="wide")
+st.set_page_config(page_title="VLESS 极速流媒体版", page_icon="🚀", layout="wide")
 
-# 定义当前版本支持的所有模式
+# 定义支持的模式
 VALID_MODES = [
     "☀️ 正常使用排位", 
     "🌙 晚高峰避峰排位", 
-    "🤖 GPT 独享专线"
+    "🤖 GPT 独享专线",
+    "🎬 流媒体解锁专线"  # <--- 新增模式
 ]
 
 RESULT_FILE = "scan_results.json"
 CONFIG_FILE = "app_config.json"
 SAVED_IP_FILE = "good_ips.txt"
 
+# ⚡ 极速启动种子：电信友好的 104.19 和 172.64 段，免去爬虫等待
+QUICK_SEEDS = [
+    "104.19.19.19", "104.19.23.23", "172.64.198.1", "172.64.0.1",
+    "104.19.112.1", "104.18.18.18", "172.67.1.1", "104.16.16.16"
+]
+
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
     div[data-testid="column"] { background-color: #15171e; border: 1px solid #262730; border-radius: 8px; padding: 15px; }
-    /* 选中 GPT 模式时的特效 */
-    .gpt-active { border: 2px solid #2ECC71 !important; }
+    /* 状态徽章 */
+    .status-native { color: #d63384; font-weight: bold; border: 1px solid #d63384; padding: 2px 6px; border-radius: 4px; }
+    .status-gpt { color: #2ECC71; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -46,125 +54,116 @@ st.markdown("""
 # ===========================
 
 def get_config():
-    """读取配置，并包含自动纠错逻辑"""
-    default_conf = {"mode": VALID_MODES[0]} # 默认使用第一个模式
-    
+    default_conf = {"mode": VALID_MODES[0]}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 saved_conf = json.load(f)
-                # 关键修复：检查保存的模式是否在当前支持的列表中
                 if saved_conf.get("mode") not in VALID_MODES:
-                    return default_conf # 如果是旧版本的模式，强制重置
+                    return default_conf
                 return saved_conf
-        except:
-            return default_conf
+        except: return default_conf
     return default_conf
 
 def save_config(mode):
     with open(CONFIG_FILE, "w") as f: json.dump({"mode": mode}, f)
 
-def get_time_slot():
-    h = datetime.now().hour
-    if 19 <= h <= 23: return "PEAK"
-    if 1 <= h <= 6:   return "IDLE"
-    return "NORMAL"
-
-def get_geo_and_gpt_status(ip):
+def get_geo_info(ip):
+    """
+    获取地理位置 + GPT状态 + 原生流媒体判定
+    """
     try:
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country,isp,hosting"
-        r = requests.get(url, timeout=2).json()
+        url = f"http://ip-api.com/json/{ip}?fields=countryCode,isp,hosting"
+        r = requests.get(url, timeout=1.5).json() # 缩短超时，提速
         cc = r.get("countryCode", "US")
-        isp = r.get("isp", "")
+        isp = r.get("isp", "Cloudflare")
+        # 核心：hosting=False 通常意味着是原生 IP (ISP IP)，适合流媒体
+        is_native = not r.get("hosting", True) 
         
-        region_map = {
-            'CN': '🇨🇳 中国', 'HK': '🇭🇰 香港', 'MO': '🇲🇴 澳门',
-            'US': '🇺🇸 美国', 'JP': '🇯🇵 日本', 'SG': '🇸🇬 新加坡',
-            'KR': '🇰🇷 韩国', 'TW': '🇹🇼 台湾', 'GB': '🇬🇧 英国'
-        }
-        region_name = region_map.get(cc, f"🌍 {cc}")
+        region_map = {'CN': '🇨🇳', 'HK': '🇭🇰', 'US': '🇺🇸', 'JP': '🇯🇵', 'SG': '🇸🇬', 'KR': '🇰🇷', 'TW': '🇹🇼', 'GB': '🇬🇧'}
+        flag = region_map.get(cc, cc)
         
-        blocked_cc = ['CN', 'HK', 'RU', 'IR', 'KP', 'CU', 'SY', 'MO']
-        gpt_status = "✅ 支持" if cc not in blocked_cc else "❌ 不支持"
+        blocked_cc = ['CN', 'HK', 'RU', 'IR', 'KP']
+        gpt_status = "✅" if cc not in blocked_cc else "❌"
         
-        return {"cc": cc, "region": region_name, "isp": isp, "gpt": gpt_status}
+        return {"cc": cc, "flag": flag, "isp": isp, "gpt": gpt_status, "is_native": is_native}
     except:
-        return {"cc": "Unk", "region": "❓ 未知", "isp": "Unk", "gpt": "❓ 未知"}
+        return {"cc": "Unk", "flag": "❓", "isp": "Unk", "gpt": "❓", "is_native": False}
 
 def check_tls_handshake(ip):
     try:
         context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
         conn = context.wrap_socket(socket.socket(socket.AF_INET), server_hostname="speed.cloudflare.com")
-        conn.settimeout(1.5)
-        t1 = time.perf_counter()
-        conn.connect((ip, 443))
-        dur = (time.perf_counter() - t1) * 1000
+        conn.settimeout(1.0) # 进一步缩短 TLS 超时，提速
+        t1 = time.perf_counter(); conn.connect((ip, 443)); dur = (time.perf_counter() - t1) * 1000
         conn.close()
         return {"status": True, "latency": int(dur)}
-    except:
-        return {"status": False, "latency": 9999}
+    except: return {"status": False, "latency": 9999}
 
-def calculate_score(mode, avg, jitter, loss, speed, gpt_status, tls_ok):
+def calculate_score(mode, p0, speed, geo, tls_ok):
     if not tls_ok: return 0 
-    if mode == "🤖 GPT 独享专线" and gpt_status != "✅ 支持": return 0
-
     score = 100.0
-    loss_penalty = 6 if mode != "🤖 GPT 独享专线" else 4
-    score -= (loss * loss_penalty)
     
-    limit = 280 if mode == "🤖 GPT 独享专线" else 180
-    if avg > limit: score -= (avg - limit) / 5
+    # 基础扣分
+    score -= (p0['loss'] * 5)
+    limit = 280 if mode in ["🤖 GPT 独享专线", "🎬 流媒体解锁专线"] else 180
+    if p0['avg'] > limit: score -= (p0['avg'] - limit) / 5
+    score -= p0['jitter'] * 1.5
+    score += min(speed * 4, 30)
     
-    score -= jitter * 1.5
-    score += min(speed * 3, 30)
-    
-    if mode == "🤖 GPT 独享专线" and gpt_status == "✅ 支持": score += 10
+    # === 模式加成 ===
+    # 1. GPT 模式
+    if mode == "🤖 GPT 独享专线":
+        if geo['gpt'] == "❌": return 0 # 必须支持GPT
+        if geo['cc'] in ['US', 'JP', 'SG']: score += 15
+        
+    # 2. 流媒体模式 (看重原生)
+    elif mode == "🎬 流媒体解锁专线":
+        if geo['is_native']: score += 30 # 原生IP大幅加分
+        else: score -= 20 # 非原生扣分
+        
+    # 3. 避峰模式
+    elif mode == "🌙 晚高峰避峰排位":
+        score -= p0['loss'] * 5 
+
     return max(0, round(score, 1))
 
-def ping0_tcp_test(ip, count=6):
+def ping0_tcp_test(ip, count=4): # 减少次数到4次，大幅提速
     lats, success = [], 0
     for _ in range(count):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.6)
+            s.settimeout(0.5) # 极速超时
             t1 = time.perf_counter(); s.connect((ip, 443)); s.close()
             lats.append((time.perf_counter() - t1) * 1000); success += 1
         except: pass
-        time.sleep(0.05)
     if not lats: return {"avg": 9999, "jitter": 999, "loss": 100}
     return {"avg": int(statistics.mean(lats)), "jitter": int(statistics.stdev(lats)) if len(lats) > 1 else 0, "loss": int(((count-success)/count)*100)}
 
 def get_china_latency(ip):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5); t1 = time.perf_counter(); s.connect((ip, 443))
+        s.settimeout(0.4); t1 = time.perf_counter(); s.connect((ip, 443))
         dur = (time.perf_counter() - t1) * 1000; s.close()
         return int(dur)
     except: return 999
 
-def sync_dns(ip):
-    try:
-        if "api_token" not in st.secrets: return "⚠️ 无 Secrets"
-        cfg = st.secrets
-        url = f"https://api.cloudflare.com/client/v4/zones/{cfg['zone_id']}/dns_records"
-        headers = {"Authorization": f"Bearer {cfg['api_token']}", "Content-Type": "application/json"}
-        recs = requests.get(url, headers=headers, params={"name": cfg['record_name']}, timeout=5).json()
-        if recs["result"]:
-            rid = recs["result"][0]["id"]
-            if recs["result"][0]["content"] == ip: return f"✅ 稳定 ({ip})"
-            requests.put(f"{url}/{rid}", headers=headers, json={"type":"A","name":cfg['record_name'],"content":ip,"ttl":60,"proxied":False})
-            return f"🚀 切换: {ip}"
-    except: return "❌ API 异常"
-    return "⚠️ 记录丢失"
-
 # ===========================
-# 3. 智能爬虫
+# 3. 智能爬虫 (分级启动)
 # ===========================
-def smart_crawler(mode, time_slot):
-    pool, seen = [], set()
+def smart_crawler(mode, first_run=False):
+    pool = []
+    seen = set()
     
+    # 🚀 阶段一：极速种子 (首次运行只跑这个，秒开)
+    if first_run:
+        for ip in QUICK_SEEDS:
+            pool.append({"ip": ip, "source": "🚀 极速种子"})
+        return pool
+
+    # 🚜 阶段二：常规爬取 (后续循环跑这个)
+    # 1. 本地固态
     if os.path.exists(SAVED_IP_FILE):
         with open(SAVED_IP_FILE, "r") as f:
             local_ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', f.read())
@@ -172,41 +171,41 @@ def smart_crawler(mode, time_slot):
                 if ip not in seen:
                     pool.append({"ip": ip, "source": "📂 本地固态"}); seen.add(ip)
 
-    if pool:
-        parents = [n['ip'] for n in pool[:5]]
-        for ip in parents:
-            subnet = ".".join(ip.split(".")[:3])
-            for _ in range(3):
-                child = f"{subnet}.{random.randint(1, 254)}"
-                if child not in seen:
-                    pool.append({"ip": child, "source": "🧬 基因衍生"}); seen.add(child)
-
-    if time_slot != "PEAK":
-        try:
-            # 增加了针对 GPT 友好的源
-            urls = ["https://www.cloudflare.com/ips-v4", "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
-            for u in urls:
-                txt = requests.get(u, timeout=3).text
-                found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
-                # 针对 GPT 模式的特殊过滤：优先取 104.19 段 (SJC 较多)
-                if mode == "🤖 GPT 独享专线":
-                    found = [ip for ip in found if ip.startswith("104.19") or ip.startswith("172.64")] + found
-                
-                sample_size = 50 if mode == "🤖 GPT 独享专线" else 30
-                for ip in random.sample(found, min(len(found), sample_size)):
-                    if ip not in seen:
-                        pool.append({"ip": ip, "source": "🕷️ 全网爬虫"}); seen.add(ip)
-        except: pass
+    # 2. 全网爬虫 (仅非高峰或特定模式)
+    try:
+        urls = ["https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
+        for u in urls:
+            # 缩短请求超时
+            try: txt = requests.get(u, timeout=2).text
+            except: continue
+            
+            found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
+            # 过滤逻辑
+            if mode == "🤖 GPT 独享专线":
+                found = [ip for ip in found if ip.startswith("104.19") or ip.startswith("172.64")] + found
+            
+            limit = 40 if mode == "🎬 流媒体解锁专线" else 30
+            for ip in random.sample(found, min(len(found), limit)):
+                if ip not in seen:
+                    pool.append({"ip": ip, "source": "🕷️ 全网爬虫"}); seen.add(ip)
+    except: pass
     return pool
 
 def background_worker():
+    # 标记是否是第一次运行
+    is_first_run = True
+    
     while True:
         try:
-            cfg = get_config(); mode = cfg["mode"]; time_slot = get_time_slot()
-            pool = smart_crawler(mode, time_slot)
+            cfg = get_config(); mode = cfg["mode"]
+            
+            # 智能切换：如果是第一次，只跑种子，3秒出结果
+            pool = smart_crawler(mode, first_run=is_first_run)
+            is_first_run = False # 下次就跑全量
             
             results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+            # 提高并发到 30
+            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
                 def process_node(node):
                     ip = node['ip']
                     cn_lat = get_china_latency(ip)
@@ -216,25 +215,22 @@ def background_worker():
                     if not tls['status']: return None 
                     
                     speed = 0.0
-                    try:
+                    try: # 极速测速 (100KB)
                         st_t = time.perf_counter()
-                        r = requests.get(f"http://{ip}/__down?bytes=200000", headers={"Host": "speed.cloudflare.com"}, timeout=2)
+                        r = requests.get(f"http://{ip}/__down?bytes=100000", headers={"Host": "speed.cloudflare.com"}, timeout=1.5)
                         speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
-                    geo = get_geo_and_gpt_status(ip)
+                    geo = get_geo_info(ip)
                     p0 = ping0_tcp_test(ip)
-                    if p0['loss'] > 25: return None
                     
-                    score = calculate_score(mode, p0['avg'], p0['jitter'], p0['loss'], speed, geo['gpt'], True)
-                    
+                    score = calculate_score(mode, p0, speed, geo, True)
                     if score <= 0: return None
                     
                     return {
                         "ip": ip, "score": score, "cn_lat": cn_lat, "speed": round(speed, 2),
-                        "loss": p0['loss'], "jitter": p0['jitter'], 
-                        "source": node['source'], "region": geo['region'], "gpt": geo['gpt'],
-                        "tls_lat": tls['latency']
+                        "loss": p0['loss'], "source": node['source'], 
+                        "flag": geo['flag'], "gpt": geo['gpt'], "is_native": geo['is_native']
                     }
 
                 futs = [ex.submit(process_node, n) for n in pool]
@@ -245,14 +241,23 @@ def background_worker():
             if results:
                 results.sort(key=lambda x: x['score'], reverse=True)
                 winner = results[0]
+                
                 with open(SAVED_IP_FILE, "a") as f:
                     for r in results[:3]: f.write(f"{r['ip']}\n")
-                sync_dns(winner['ip'])
-                state = {"last_run": datetime.now().strftime("%H:%M:%S"), "time_slot": time_slot, "mode": mode, "winner": winner, "sync_msg": "已同步", "table": results[:25]}
+                
+                # 写入结果 (增加 update_type 字段告诉前端是种子还是全量)
+                state = {
+                    "last_run": datetime.now().strftime("%H:%M:%S"), 
+                    "mode": mode, "winner": winner, 
+                    "table": results[:25],
+                    "fast_mode": is_first_run # 标记
+                }
                 with open(RESULT_FILE, "w") as f: json.dump(state, f)
                 
         except Exception as e: print(f"Worker Error: {e}")
-        time.sleep(300 if mode == "🤖 GPT 独享专线" else 600)
+        
+        # 极速种子跑完后，稍微休息一下马上跑全量，全量跑完休息久一点
+        time.sleep(5 if len(pool) < 15 else 300)
 
 if "bg_thread" not in st.session_state:
     import threading
@@ -260,78 +265,65 @@ if "bg_thread" not in st.session_state:
     st.session_state.bg_thread = True
 
 # ===========================
-# 4. 前端展示 (严格匹配)
+# 4. 前端展示
 # ===========================
 with st.sidebar:
     st.header("🐼 四川电信控制台")
-    
-    # 获取配置（已含自动纠错）
     curr = get_config()
     current_mode = curr.get("mode")
-    
-    # 确保当前模式在列表中，防止 index 报错
-    try:
-        default_index = VALID_MODES.index(current_mode)
-    except ValueError:
-        default_index = 0
+    try: default_index = VALID_MODES.index(current_mode)
+    except: default_index = 0
         
     new_mode = st.radio("排位模式", VALID_MODES, index=default_index)
     
     if new_mode != current_mode:
         save_config(new_mode)
         st.toast(f"模式已切换: {new_mode}", icon="🚀")
-        time.sleep(1)
-        st.rerun() # 立即刷新以应用新模式
-    
-    # 根据模式显示不同的提示
-    if new_mode == "🤖 GPT 独享专线":
-        st.success("🤖 GPT 模式已激活\n\n自动过滤非 GPT 地区，延迟容忍度放宽至 280ms。")
-    elif new_mode == "🌙 晚高峰避峰排位":
-        st.warning("🌙 避峰模式已激活\n\n严厉打击丢包，优先选择冷门 IP 段。")
-    else:
-        st.info("☀️ 正常模式\n\n均衡负载，兼顾速度与延迟。")
+        time.sleep(0.5)
+        st.rerun()
 
-st.title("🐼 VLESS 电信 GPT 专版")
+st.title("🚀 VLESS 极速流媒体版")
 
 if os.path.exists(RESULT_FILE):
     with open(RESULT_FILE, "r") as f: data = json.load(f)
     winner = data['winner']
     df = pd.DataFrame(data['table'])
     
-    # 动态显示当前模式，与 Sidebar 保持一致
-    st.caption(f"当前运行策略: {data['mode']} | 上次更新: {data['last_run']}")
+    st.caption(f"当前策略: {data['mode']} | 更新时间: {data['last_run']}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("👑 冠军 IP", winner['ip'])
-    c2.metric("🔒 TLS 握手", f"{winner['tls_lat']} ms")
+    # 显示流媒体状态
+    native_tag = "原生解锁" if winner['is_native'] else "非原生"
+    c2.metric("🎬 流媒体/GPT", f"{native_tag} | {winner['gpt']}")
     c3.metric("📉 延迟/丢包", f"{winner['cn_lat']}ms / {winner['loss']}%")
     c4.metric("📊 得分", f"{winner['score']}")
     
     st.divider()
 
-    st.subheader("🧬 节点分布图")
-    st.scatter_chart(df, x='cn_lat', y='score', color='gpt', size='speed', use_container_width=True)
-
     st.subheader("📋 详细报告")
     st.dataframe(
         df,
-        column_order=("score", "ip", "gpt", "tls_lat", "cn_lat", "loss", "speed", "source"),
+        column_order=("score", "ip", "flag", "is_native", "gpt", "cn_lat", "speed", "source"),
         column_config={
-            "tls_lat": st.column_config.NumberColumn("TLS握手", format="%d ms"),
             "score": st.column_config.ProgressColumn("得分", format="%.0f", min_value=0, max_value=100),
-            "cn_lat": st.column_config.NumberColumn("TCP延迟", format="%d ms"),
-            "loss": st.column_config.NumberColumn("丢包", format="%d%%"),
-            "speed": st.column_config.NumberColumn("速度", format="%.2f MB/s"),
+            "flag": st.column_config.TextColumn("地区"),
+            "is_native": st.column_config.CheckboxColumn("原生解锁?", help="原生IP通常支持 Netflix/Disney+"),
+            "gpt": st.column_config.TextColumn("GPT"),
+            "cn_lat": st.column_config.NumberColumn("延迟", format="%d ms"),
+            "speed": st.column_config.NumberColumn("速度", format="%.1f MB/s"),
+            "source": st.column_config.TextColumn("来源"),
         },
         use_container_width=True,
         hide_index=True
     )
 
 else:
-    st.warning("🐼 系统正在初始化... 首次运行可能需要 15-30 秒")
-    st.progress(0.3)
-    time.sleep(5)
+    # 这里的等待时间会非常短，因为后台先跑种子
+    st.info("🚀 正在进行极速启动 (Rocket Start)... 预计 3 秒")
+    time.sleep(2) 
     st.rerun()
 
+# 自动刷新保持数据新鲜
 time.sleep(10)
 st.rerun()
