@@ -15,181 +15,79 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===========================
-# 1. 页面配置 (Ping0 风格配色)
+# 1. 页面配置 & 样式
 # ===========================
-st.set_page_config(page_title="VLESS 竞速 - Ping0 增强版", page_icon="📶", layout="wide")
+st.set_page_config(page_title="VLESS 终极竞速-Ping0加强版", page_icon="🏎️", layout="wide")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #0e1117; color: #ffffff; }
-    /* 模仿 Ping0 的深蓝色面板 */
-    div[data-testid="column"] { 
-        background-color: #1a1c24; 
-        border: 1px solid #2d3139; 
-        border-radius: 10px; 
-        padding: 20px; 
-    }
-    .ping0-label { color: #8a92a6; font-size: 0.8rem; font-weight: bold; }
-    .ping0-value { color: #00ff41; font-family: 'Courier New', monospace; font-size: 1.5rem; }
-    .stMetricValue { color: #00ff41 !important; font-family: 'Courier New', monospace; }
+    .stApp { background-color: #001f3f; color: #E0E0E0; }
+    div[data-testid="column"] { background-color: #003366; border: 1px solid #0074D9; border-radius: 8px; padding: 15px; }
+    div[data-testid="stMetricValue"] { color: #2ECC40 !important; font-family: 'Courier New', monospace; }
+    .auto-active { color: #FF851B; font-weight: bold; animation: blinker 1.5s linear infinite; }
+    @keyframes blinker { 50% { opacity: 0; } }
     </style>
     """, unsafe_allow_html=True)
 
 # ===========================
-# 2. 核心逻辑：Ping0 (TCP) 模拟引擎
+# 2. 基础配置 (从 Secrets 或本地读取)
+# ===========================
+try:
+    CF_CONFIG = {
+        "api_token": st.secrets["api_token"].strip(),
+        "zone_id": st.secrets["zone_id"].strip(),
+        "record_name": st.secrets["record_name"].strip(),
+    }
+except:
+    st.warning("⚠️ 检测到本地运行或 Secrets 缺失，解析同步功能将暂时跳过。")
+    CF_CONFIG = None
+
+DB_FILE = "racing_history.log"
+SAVED_IP_FILE = "good_ips.txt"
+
+# ===========================
+# 3. 核心功能组件 (All-in-One 整合)
 # ===========================
 
-def ping0_tcp_test(ip, port=443, count=5):
-    """
-    模拟 Ping0.com 的 TCP 探测机制
-    进行 5 次高精度握手测试，计算平均值、最小值和抖动
-    """
+@st.cache_data(ttl=3600)
+def get_ip_info(ip):
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
+        r = requests.get(url, timeout=2).json()
+        cc = r.get("countryCode", "UNK")
+        if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG']: return "🌏 亚洲", r.get("country")
+        return "🌍 其他", r.get("country")
+    except: return "🛸 未知", "Unknown"
+
+def ping0_core_test(ip, port=443, count=4):
+    """模拟 Ping0 的 TCP 深度探测"""
     latencies = []
-    success = 0
     for _ in range(count):
         try:
             start = time.perf_counter()
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1.0)
+            s.settimeout(0.8)
             s.connect((ip, port))
             s.close()
-            # 毫秒级精度
             latencies.append((time.perf_counter() - start) * 1000)
-            success += 1
-        except:
-            pass
-        time.sleep(0.02) # 探测间隔
+        except: pass
     
-    if not latencies:
-        return {"avg": 9999, "min": 9999, "jitter": 0, "loss": 100}
-    
+    if not latencies: return {"avg": 9999, "jitter": 0, "loss": 100}
     return {
         "avg": int(statistics.mean(latencies)),
-        "min": int(min(latencies)),
         "jitter": int(statistics.stdev(latencies)) if len(latencies) > 1 else 0,
-        "loss": int(((count - success) / count) * 100)
+        "loss": int(((count - len(latencies)) / count) * 100)
     }
 
-# ===========================
-# 3. 增强版深度评测
-# ===========================
-
-def deep_test_node(node):
-    ip = node['ip']
+def get_enhanced_pool():
+    """电信级高数量爬虫"""
+    competitors = []
+    seen_ips = set()
     
-    # --- Ping0 测试环节 ---
-    p0 = ping0_tcp_test(ip)
-    if p0['avg'] > 1500: return None # 响应太慢直接过滤
+    # 1. 电信精选段
+    for ip in ["1.0.0.1", "1.1.1.1", "104.16.0.1", "172.67.1.1"]:
+        competitors.append({"ip": ip, "source": "💎 电信种子"})
+        seen_ips.add(ip)
 
-    # --- 地理位置识别 ---
-    try:
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode,country"
-        r = requests.get(url, timeout=2).json()
-        region = r.get("country", "Unknown")
-        cc = r.get("countryCode", "UNK")
-        area = "🌏 亚洲" if cc in ['CN', 'HK', 'TW', 'JP', 'KR', 'SG'] else "🌍 其他"
-    except:
-        area, region = "🛸 未知", "Unknown"
-
-    # --- 速度实测 (2MB) ---
-    speed_mb = 0.0
-    try:
-        s_time = time.perf_counter()
-        r = requests.get(f"http://{ip}/__down?bytes=2000000", 
-                         headers={"Host": "speed.cloudflare.com"}, timeout=4)
-        if r.status_code == 200:
-            speed_mb = (len(r.content)/1024/1024) / (time.perf_counter() - s_time)
-    except: pass
-
-    # --- 电信专属综合评分 ---
-    # 延迟分(40%) + 丢包罚分(30%) + 速度加分(30%)
-    score = 100 - (p0['avg'] / 5) - (p0['loss'] * 20) + (speed_mb * 12) - (p0['jitter'] * 2)
-
-    return {
-        "ip": ip, "area": area, "country": region, 
-        "score": round(score, 1), "tcp_avg": p0['avg'], 
-        "tcp_min": p0['min'], "jitter": p0['jitter'],
-        "loss": p0['loss'], "speed": round(speed_mb, 2),
-        "source": node['source']
-    }
-
-# ===========================
-# 4. UI 界面与自动化
-# ===========================
-st.title("🏎️ VLESS 竞速 - Ping0 自动化排位版")
-
-# 侧边栏与 10 分钟自动逻辑
-if "last_run" not in st.session_state: st.session_state.last_run = datetime.min
-
-with st.sidebar:
-    st.header("⚙️ 自动化中心")
-    auto_on = st.toggle("开启 10 分钟自动更新", value=True)
-    st.write(f"上次运行: {st.session_state.last_run.strftime('%H:%M:%S')}")
-    if st.button("🗑️ 重置本地库"):
-        if os.path.exists("good_ips.txt"): os.remove("good_ips.txt")
-
-# 核心触发逻辑
-now = datetime.now()
-should_run = (auto_on and (now - st.session_state.last_run >= timedelta(minutes=10)))
-
-if st.button("🏁 手动强制排位", type="primary") or should_run:
-    st.session_state.last_run = now
-    
-    # 选手池（复用之前的高质量爬虫）
-    from __main__ import get_enhanced_pool # 假设此函数在同文件
-    tasks = get_enhanced_pool() 
-    
-    with st.status("🚀 正在启动 Ping0 级探测...", expanded=True) as status:
-        results = []
-        progress = st.progress(0)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-            futs = [ex.submit(deep_test_node, t) for t in tasks]
-            for i, f in enumerate(concurrent.futures.as_completed(futs)):
-                progress.progress((i + 1) / len(tasks))
-                res = f.result()
-                if res: results.append(res)
-        status.update(label="✅ 测试完成", state="complete")
-
-    if results:
-        results.sort(key=lambda x: x['score'], reverse=True)
-        winner = results[0]
-        
-        # 冠军面板：Ping0 风格展示
-        st.subheader("🏆 冠军节点 (Ping0 数据)")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.markdown("<p class='ping0-label'>IP 地址</p>", unsafe_allow_html=True)
-            st.markdown(f"<p class='ping0-value'>{winner['ip']}</p>", unsafe_allow_html=True)
-        with col2:
-            st.metric("Ping0 (TCP AVG)", f"{winner['tcp_avg']} ms")
-        with col3:
-            st.metric("带宽 (2MB Test)", f"{winner['speed']} MB/s")
-        with col4:
-            st.metric("丢包率", f"{winner['loss']}%")
-
-        # 详细表格
-        st.divider()
-        df = pd.DataFrame(results)
-        st.dataframe(
-            df[['score', 'ip', 'tcp_avg', 'tcp_min', 'jitter', 'speed', 'country']],
-            use_container_width=True,
-            column_config={
-                "tcp_avg": "平均延迟",
-                "tcp_min": "最小延迟",
-                "jitter": "抖动",
-                "speed": "测速(MB/s)"
-            }
-        )
-        
-        # 自动同步 DNS
-        from __main__ import sync_dns
-        st.info(sync_dns(winner['ip']))
-
-    if auto_on:
-        time.sleep(10) # 缓冲
-        st.rerun()
-
-# 自动刷新占位
-if auto_on:
-    time.sleep(30)
-    st.rerun()
+    # 2. 历史精英
+    if os.path.exists(SAVED_IP
