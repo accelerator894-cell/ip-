@@ -1,37 +1,3 @@
-为什么还是只有6个，并没有新增？  
-简单说：**程序在后台确实尝试了新增/补位，但你的网络环境太恶劣，导致新IP测试失败率极高，基本都进黑名单了**，所以有效节点始终停在6个。
-
-### 具体原因分析（从你截图看）
-
-1. **当前有效节点来源全是“优质种子”**  
-   - 6个IP全部来自 QUICK_SEEDS（你的固定种子列表），没有“历史优选”“爬虫”“冷门”“补位随机”等来源。
-   - 说明：程序尝试了补位，但新增的IP（随机生成的或爬的）在测试时全部失败，没一个成功保存到数据库。
-
-2. **成功率太低**（9测6成，失败率33%+）  
-   - 你的4G + VPN 速度只有2~4 KB/s，延迟高、丢包严重。
-   - 测试新IP时，`socket.connect()` 经常超时（3秒内连不上），或下载卡死（10秒内没数据）。
-   - 代码逻辑：失败3~7次进黑名单，新IP第一次测失败几次就永久排除。
-   - 结果：新增IP几乎全被黑名单，数据库只留下了这6个“活的”种子。
-
-3. **补位逻辑触发了，但无效**  
-   - 代码里有 `if len(db) < 10` → 随机生成新IP补位。
-   - 但这些随机IP（从黄金段）大部分不是真正可用的CF节点，或被墙/回收，测试失败 → 没新增。
-
-4. **爬虫池几乎没贡献**  
-   - 爬取源（GitHub、shodan.uk、chaoming）在你网络下基本失败（超时或返回空）。
-   - 池子保持20个，但实际没爬到新货。
-
-### 解决方案：强制“先活下来，再补位”（针对你环境）
-
-**新思路**：
-- 降低黑名单门槛（失败10次才黑名单）。
-- 补位时**优先用已活的6个 + QUICK_SEEDS**，随机生成时**多生成几轮**。
-- **关闭爬虫**（你网络太慢，爬虫反而拖后腿），先用随机生成 + 种子补到10个。
-- 成功率低时**自动重测已活IP**，保持稳定。
-
-**完整代码**（已整合以上优化，直接替换运行）：
-
-```python
 import streamlit as st
 import requests
 import time
@@ -60,6 +26,8 @@ BASE_DIR = Path(__file__).parent
 FILES = {
     "results": BASE_DIR / "scan_results.json",
     "database": BASE_DIR / "ip_database.json",
+    "crawlers": BASE_DIR / "crawler_pool.json",
+    "niches": BASE_DIR / "niche_pool.json",
     "config": BASE_DIR / "app_config.json",
     "blacklist": BASE_DIR / "blacklist.json",
     "fail_count": BASE_DIR / "fail_count.json"
@@ -71,15 +39,15 @@ DEFAULT_CONFIG = {
     "port": 443,
     "uuid": "",
     "ws_path": "/",
-    "max_workers": 12,
+    "max_workers": 15,
     "connect_timeout": 4.0,
     "download_timeout": 12.0,
     "geo_cache_hours": 6,
     "test_bytes_by_mode": {
-        "☀️ 正常使用排位": 30_000,
-        "⚡ 极速低延迟": 20_000,
-        "🤖 GPT 独享专线": 80_000,
-        "🎬 流媒体解锁专线": 150_000,
+        "☀️ 正常使用排位": 50_000,
+        "⚡ 极速低延迟": 30_000,
+        "🤖 GPT 独享专线": 100_000,
+        "🎬 流媒体解锁专线": 200_000,
     }
 }
 
@@ -163,7 +131,31 @@ class IPPoolManager:
         safe_write_json(FILES["blacklist"], list(bl))
 
     @staticmethod
-    def fill_niche_pool(max_size=20):
+    def fill_crawler_pool(max_size=30):
+        current = safe_json(FILES["crawlers"], [])
+        if len(current) >= max_size: return
+        sources = [
+            "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt",
+            "https://cfip.shodan.uk/",
+            "https://api.chaoming.cc/cfip",
+        ]
+        found = set(current)
+        blacklist = IPPoolManager.get_blacklist()
+        for url in sources:
+            try:
+                r = requests.get(url, timeout=20)
+                ips = re.findall(r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)', r.text)
+                for ip in ips:
+                    if ip not in blacklist and ip not in found:
+                        found.add(ip)
+            except Exception as e:
+                logger.warning(f"爬虫源 {url} 失败: {e}")
+        new_list = list(found)[:max_size]
+        safe_write_json(FILES["crawlers"], new_list)
+        logger.info(f"爬虫池更新: {len(new_list)} 个")
+
+    @staticmethod
+    def fill_niche_pool(max_size=30):
         current = safe_json(FILES["niches"], [])
         if len(current) >= max_size: return
         blacklist = IPPoolManager.get_blacklist()
@@ -185,7 +177,7 @@ def evolution_engine():
     db = safe_json(FILES["database"])
     fail_counts = defaultdict(int, safe_json(FILES["fail_count"]))
 
-    logger.info("启动补位到10...")
+    logger.info("启动扫描 + 自动爬取 + 补位到10...")
 
     first_round_done = False
     min_nodes = 10
@@ -196,20 +188,28 @@ def evolution_engine():
             now = time.time()
             is_full_scan = (now - time.time() % 300) < 10
 
+            # 强制爬取（70% 概率）
+            if random.random() < 0.7:
+                threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
+                threading.Thread(target=IPPoolManager.fill_niche_pool).start()
+
             targets = []
             targets.extend({"ip": ip, "src": "⚡ 优质种子"} for ip in QUICK_SEEDS)
 
-            # 补位核心：如果 <10，用已活的 + 随机新IP
             if len(db) < min_nodes:
                 if db:
                     sorted_db = sorted(db.items(), key=lambda x: x[1].get('score', 0), reverse=True)
                     targets.extend({"ip": ip, "src": "🏆 已活节点"} for ip, _ in sorted_db)
-                # 强制随机生成新IP补位
-                for _ in range(30):  # 多生成，确保有新货
+                # 补位随机生成
+                for _ in range(40):
                     net = ipaddress.ip_network(random.choice(GOLDEN_SUBNETS))
                     candidate = str(net.network_address + random.randint(1, net.num_addresses - 3))
-                    if candidate not in db and candidate not in targets:
+                    if candidate not in db:
                         targets.append({"ip": candidate, "src": "💎 补位随机"})
+
+            if first_round_done:
+                targets.extend({"ip": ip, "src": "🕷️ 爬虫"} for ip in safe_json(FILES["crawlers"], []))
+                targets.extend({"ip": ip, "src": "💎 冷门"} for ip in safe_json(FILES["niches"], []))
 
             blacklist = IPPoolManager.get_blacklist()
             seen = set()
@@ -269,7 +269,7 @@ def evolution_engine():
                             fail_counts[ip] = 0
                         else:
                             fail_counts[ip] += 1
-                            if fail_counts[ip] >= 10:  # 放宽到10次才黑名单
+                            if fail_counts[ip] >= 10:
                                 IPPoolManager.add_to_blacklist(ip)
                                 logger.info(f"IP {ip} 失败10次，黑名单")
 
@@ -282,7 +282,7 @@ def evolution_engine():
                             IPPoolManager.add_to_blacklist(ip)
                         return None
 
-                futures = [executor.submit(test_ip, t) for t in unique_targets[:150]]
+                futures = [executor.submit(test_ip, t) for t in unique_targets[:200]]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res:
@@ -301,9 +301,8 @@ def evolution_engine():
 
                 if not first_round_done:
                     first_round_done = True
-                    logger.info("第一轮完成，开始补位到10")
+                    logger.info("第一轮完成，开始补位 + 自动进化")
 
-            # 补位提示
             if len(db) < 10:
                 logger.info(f"有效节点 {len(db)} 个，继续补位...")
 
@@ -348,7 +347,7 @@ data = safe_json(FILES["results"])
 
 if not data or not data.get("winner"):
     st.title("🧬 Cloudflare 猎手 · 进化版")
-    st.info("引擎启动中... 预计5~20秒，正在补位到10个...")
+    st.info("引擎启动中... 正在补位到10个 + 自动爬取进化...")
     time.sleep(3)
     st.rerun()
 
@@ -398,16 +397,6 @@ else:
         hide_index=True
     )
 
-    st.caption(f"最后更新: {data['last_run']}　｜　每8秒刷新一次")
+    st.caption(f"最后更新: {data['last_run']}　｜　每8秒刷新一次（自动爬取 + 优选替换中）")
     time.sleep(8)
     st.rerun()
-```
-
-**操作**：
-1. 删除所有 json 文件（清空历史）
-2. 运行代码
-3. 启动后会**强制补位**：用6个活的 + 随机新IP反复测，直到数据库有10个有效节点
-4. 黑名单门槛10次，失败也多给机会
-
-这次绝对会先补到10个（或更多），因为补位用了30个随机IP循环生成。  
-跑起来试试，告诉我是否补到了10个！如果还是卡，贴 log，我继续帮你。加油哥们！
