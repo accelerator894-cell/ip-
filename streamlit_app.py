@@ -18,11 +18,8 @@ from collections import defaultdict
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-5s | %(message)s',
-    handlers=[logging.FileHandler("cf_hunter.log", encoding='utf-8')]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-5s | %(message)s',
+                    handlers=[logging.FileHandler("cf_hunter.log", encoding='utf-8')])
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
@@ -43,8 +40,8 @@ DEFAULT_CONFIG = {
     "uuid": "",
     "ws_path": "/",
     "max_workers": 60,
-    "connect_timeout": 0.8,
-    "download_timeout": 3.0,
+    "connect_timeout": 1.0,
+    "download_timeout": 4.0,
     "geo_cache_hours": 6,
     "test_bytes_by_mode": {
         "☀️ 正常使用排位": 200_000,
@@ -62,7 +59,8 @@ GOLDEN_SUBNETS = [
 
 QUICK_SEEDS = [
     "104.19.19.19", "172.64.198.1", "104.19.112.1", "172.67.1.1",
-    "104.18.20.126", "172.64.155.1", "104.16.123.96", "172.67.69.1"
+    "104.18.20.126", "172.64.155.1", "104.16.123.96", "172.67.69.1",
+    "104.17.0.1", "172.65.1.1", "104.20.1.1", "172.68.1.1"
 ]
 
 geo_cache = {}
@@ -91,14 +89,13 @@ def safe_write_json(file_path: Path, data):
     except Exception as e:
         logger.error(f"写入失败 {file_path}: {e}")
 
-def get_geo_info(ip: str, timeout=2.0) -> dict:
+def get_geo_info(ip: str, timeout=2.5) -> dict:
     now = time.time()
     if ip in geo_cache and geo_cache[ip]["expire"] > now:
         return geo_cache[ip]["data"]
 
     methods = [
-        {"name": "ipinfo", "url": f"https://ipinfo.io/{ip}/json",
-         "headers": {"User-Agent": "cf-hunter/1.0"},
+        {"name": "ipinfo", "url": f"https://ipinfo.io/{ip}/json", "headers": {"User-Agent": "cf-hunter/1.0"},
          "parser": lambda d: {"cc": d.get("country", "??"), "country": d.get("country", "未知"), "city": d.get("city", ""), "source": "ipinfo"}},
         {"name": "ipapi.co", "url": f"https://ipapi.co/{ip}/json/",
          "parser": lambda d: {"cc": d.get("country_code", "??"), "country": d.get("country_name", "未知"), "city": d.get("city", ""), "source": "ipapi.co"}},
@@ -134,7 +131,7 @@ class IPPoolManager:
         safe_write_json(FILES["blacklist"], list(bl))
 
     @staticmethod
-    def fill_crawler_pool(max_size=50):
+    def fill_crawler_pool(max_size=60):
         current = safe_json(FILES["crawlers"], [])
         if len(current) >= max_size: return
         sources = [
@@ -146,22 +143,24 @@ class IPPoolManager:
         blacklist = IPPoolManager.get_blacklist()
         for url in sources:
             try:
-                r = requests.get(url, timeout=6)
+                r = requests.get(url, timeout=8)
                 ips = re.findall(r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)', r.text)
                 for ip in ips:
                     if ip not in blacklist and ip not in found:
                         found.add(ip)
             except:
                 pass
-        safe_write_json(FILES["crawlers"], list(found)[:max_size])
+        new_list = list(found)[:max_size]
+        safe_write_json(FILES["crawlers"], new_list)
+        logger.info(f"爬虫池更新: {len(new_list)} 个")
 
     @staticmethod
-    def fill_niche_pool(max_size=50):
+    def fill_niche_pool(max_size=60):
         current = safe_json(FILES["niches"], [])
         if len(current) >= max_size: return
         blacklist = IPPoolManager.get_blacklist()
         new_ips = []
-        for _ in range(max_size * 6):
+        for _ in range(max_size * 8):
             try:
                 net = ipaddress.ip_network(random.choice(GOLDEN_SUBNETS))
                 candidate = str(net.network_address + random.randint(1, net.num_addresses - 3))
@@ -171,6 +170,7 @@ class IPPoolManager:
                 continue
         combined = list(set(current + new_ips))[:max_size]
         safe_write_json(FILES["niches"], combined)
+        logger.info(f"冷门池更新: {len(combined)} 个")
 
 def evolution_engine():
     global fail_counts
@@ -182,6 +182,10 @@ def evolution_engine():
             cfg = safe_json(FILES["config"], DEFAULT_CONFIG.copy())
             now = time.time()
             is_full_scan = (now - time.time() % 300) < 10
+
+            # 每轮强制填充
+            threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
+            threading.Thread(target=IPPoolManager.fill_niche_pool).start()
 
             targets = []
             if is_full_scan:
@@ -215,12 +219,10 @@ def evolution_engine():
                         speed = 0.0
                         try:
                             st = time.perf_counter()
-                            r = requests.get(
-                                f"http://{ip}/__down?bytes={bytes_test}",
-                                headers={"Host": cfg["host"]},
-                                timeout=cfg["download_timeout"],
-                                stream=True
-                            )
+                            r = requests.get(f"http://{ip}/__down?bytes={bytes_test}",
+                                            headers={"Host": cfg["host"]},
+                                            timeout=cfg["download_timeout"],
+                                            stream=True)
                             size = 0
                             for chunk in r.iter_content(128 * 1024):
                                 size += len(chunk)
@@ -251,19 +253,19 @@ def evolution_engine():
                             fail_counts[ip] = 0
                         else:
                             fail_counts[ip] += 1
-                            if fail_counts[ip] >= 5:
+                            if fail_counts[ip] >= 7:
                                 IPPoolManager.add_to_blacklist(ip)
-                                logger.info(f"IP {ip} 连续失败5次，已加入黑名单")
+                                logger.info(f"IP {ip} 失败7次，黑名单")
 
                         success_count += 1
                         return result
                     except Exception:
                         fail_counts[ip] += 1
-                        if fail_counts[ip] >= 5:
+                        if fail_counts[ip] >= 7:
                             IPPoolManager.add_to_blacklist(ip)
                         return None
 
-                futures = [executor.submit(test_ip, t) for t in unique_targets[:300]]
+                futures = [executor.submit(test_ip, t) for t in unique_targets[:400]]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res:
@@ -280,17 +282,13 @@ def evolution_engine():
                     "debug": {"targets": len(unique_targets), "success": success_count}
                 })
 
-            if random.random() < 0.7:
-                threading.Thread(target=IPPoolManager.fill_crawler_pool).start()
-                threading.Thread(target=IPPoolManager.fill_niche_pool).start()
-
             safe_write_json(FILES["database"], db)
             safe_write_json(FILES["fail_count"], dict(fail_counts))
 
         except Exception as e:
             logger.error(f"引擎异常: {e}")
 
-        time.sleep(5)
+        time.sleep(4)
 
 if "started" not in st.session_state:
     threading.Thread(target=evolution_engine, daemon=True).start()
