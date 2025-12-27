@@ -1,59 +1,124 @@
 import streamlit as st
 import requests
 import time
+import re
+import random
+import os
 from datetime import datetime
 
-# --- 1. 自动同步逻辑 ---
-def sync_dns(new_ip):
-    token = st.secrets["api_token"].strip()
-    zone = st.secrets["zone_id"].strip()
-    name = st.secrets["record_name"].strip()
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    base_url = f"https://api.cloudflare.com/client/v4/zones/{zone}/dns_records"
-    
-    try:
-        # 查找记录
-        r = requests.get(base_url, headers=headers, params={"name": name}).json()
-        if r["success"] and r["result"]:
-            rid = r["result"][0]["id"]
-            old_ip = r["result"][0]["content"]
-            if old_ip == new_ip: return "✅ 解析已是最新"
-            
-            # 执行更新
-            u = requests.put(f"{base_url}/{rid}", headers=headers, json={
-                "type": "A", "name": name, "content": new_ip, "ttl": 60, "proxied": False
-            }).json()
-            return "🚀 自动同步成功" if u["success"] else f"❌ 同步失败: {u['errors'][0]['message']}"
-    except Exception as e:
-        return f"⚠️ 接口异常: {str(e)}"
+# --- 1. 页面配置与美化 ---
+st.set_page_config(page_title="4K 终极全自动控制台", page_icon="🏎️", layout="centered")
 
-# --- 2. 界面展示 ---
-st.title("🏎️ 4K 引擎：全自动云端版")
+# --- 2. 配置安全加载 ---
+try:
+    CF_CONFIG = {
+        "api_token": st.secrets["api_token"].strip(),
+        "zone_id": st.secrets["zone_id"].strip(),
+        "record_name": st.secrets["record_name"].strip(),
+    }
+except:
+    st.error("❌ Secrets 配置丢失，请在后台重新贴入新令牌！")
+    st.stop()
+
+DB_FILE = "best_ip_history.txt"
+
+# --- 3. 核心功能函数整合 ---
+
+def check_cf_status():
+    """诊断 API 状态"""
+    url = "https://api.cloudflare.com/client/v4/user/tokens/verify"
+    headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=5).json()
+        return "🟢 正常" if r.get("success") else f"🔴 {r.get('errors')[0]['message']}"
+    except: return "🟡 延迟"
+
+def fetch_global_ips():
+    """【功能找回】自动搜集全球 IP"""
+    sources = ["https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"]
+    ips = set()
+    try:
+        r = requests.get(sources[0], timeout=5)
+        found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', r.text)
+        ips.update(found)
+    except: pass
+    return random.sample(list(ips), min(len(ips), 10))
+
+def test_ip_performance(ip, label):
+    """【功能整合】延迟 + 流媒体解锁测试"""
+    data = {"ip": ip, "type": label, "lat": 9999, "nf": "❓"}
+    try:
+        # 测延迟
+        start = time.time()
+        requests.head(f"http://{ip}", headers={"Host": CF_CONFIG['record_name']}, timeout=1.0)
+        data["lat"] = int((time.time() - start) * 1000)
+        
+        # 测解锁 (仅对低延迟 IP 测试)
+        if data["lat"] < 200:
+            nf = requests.get(f"http://{ip}/title/80018499", headers={"Host": "www.netflix.com"}, timeout=1.2)
+            data["nf"] = "✅" if nf.status_code in [200, 301, 302] else "❌"
+    except: pass
+    return data
+
+def sync_dns(new_ip):
+    """自动修改解析记录"""
+    url = f"https://api.cloudflare.com/client/v4/zones/{CF_CONFIG['zone_id']}/dns_records"
+    headers = {"Authorization": f"Bearer {CF_CONFIG['api_token']}"}
+    try:
+        recs = requests.get(url, headers=headers, params={"name": CF_CONFIG['record_name']}).json()
+        if recs["success"] and recs["result"]:
+            rid = recs["result"][0]["id"]
+            if recs["result"][0]["content"] == new_ip: return "✅ 已是最新"
+            res = requests.put(f"{url}/{rid}", headers=headers, json={
+                "type": "A", "name": CF_CONFIG['record_name'], "content": new_ip, "ttl": 60, "proxied": False
+            }).json()
+            return "🚀 云端同步成功" if res["success"] else "❌ 同步失败"
+    except: return "⚠️ API 异常"
+
+# --- 4. 自动化主流程 ---
+
+st.title("🚀 4K 引擎：全能全自动版")
 
 with st.sidebar:
-    st.header("🔐 API 监控")
-    # 直接尝试验证新令牌
-    test_url = "https://api.cloudflare.com/client/v4/user/tokens/verify"
-    try:
-        res = requests.get(test_url, headers={"Authorization": f"Bearer {st.secrets['api_token']}"}).json()
-        if res.get("success"):
-            st.success("🟢 API 已就绪")
-        else:
-            st.error(f"🔴 受限: {res['errors'][0]['message']}")
-    except:
-        st.warning("🟡 连接云端超时")
+    st.header("⚙️ 系统监控")
+    health = check_cf_status()
+    st.metric("API 健康度", health)
+    mode = st.radio("优选偏好", ("⚡ 速度优先", "🎬 解锁优先"))
+    if st.button("🗑️ 清空历史存盘"):
+        if os.path.exists(DB_FILE): os.remove(DB_FILE)
+        st.rerun()
 
-# --- 3. 运行逻辑 ---
-# 假设你已经选出了 17ms 的冠军 IP (winner_ip)
-winner_ip = "172.64.32.12" # 示例数据，实际由你的探测逻辑生成
-st.info(f"🎯 本轮优选 IP: {winner_ip}")
+with st.spinner("🕵️ 全球巡检中，正在整合所有功能..."):
+    results = []
+    base_ips = ["108.162.194.1", "108.162.192.5", "172.64.32.12", "162.159.61.1"]
+    
+    # 搜集与测速
+    dynamic_ips = fetch_global_ips()
+    for ip in base_ips: results.append(test_ip_performance(ip, "🏠 基础"))
+    for ip in dynamic_ips: results.append(test_ip_performance(ip, "🌍 搜集"))
+    
+    active = [r for r in results if r["lat"] < 9999]
+    if active:
+        active.sort(key=lambda x: x['lat'])
+        winner = active[0]
+        
+        # 冠军展示与同步
+        st.success(f"🎯 本轮冠军：{winner['ip']} | 延迟：{winner['lat']}ms")
+        sync_status = sync_dns(winner['ip'])
+        st.info(f"🛰️ 云端状态：{sync_status}")
 
-if st.button("🛰️ 立即手动同步同步"):
-    status = sync_dns(winner_ip)
-    st.write(status)
+        # 【看板回归】
+        st.subheader("📊 实时节点分类看板")
+        st.dataframe(results, use_container_width=True)
+        
+        # 【历史记录回归】
+        if os.path.exists(DB_FILE):
+            st.divider()
+            st.subheader("📜 极品历史 IP 库")
+            with open(DB_FILE, "r") as f: st.code(f.read())
+    else:
+        st.error("😰 探测全灭，请检查令牌权限或 Zone ID！")
 
-# 自动运行逻辑
-st.caption(f"🕒 巡检时间: {datetime.now().strftime('%H:%M:%S')}")
+st.caption(f"🕒 下次更新预定: {datetime.now().strftime('%H:%M:%S')}")
 time.sleep(600)
 st.rerun()
