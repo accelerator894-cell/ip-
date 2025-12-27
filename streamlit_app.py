@@ -73,6 +73,27 @@ QUICK_SEEDS = [
 geo_cache = {}
 fail_counts = defaultdict(int)
 
+# 中英文对照（可自行扩展）
+COUNTRY_MAP = {
+    "US": "美国",
+    "SG": "新加坡",
+    "HK": "香港",
+    "JP": "日本",
+    "KR": "韩国",
+    "TW": "台湾",
+    "DE": "德国",
+    "GB": "英国",
+    "FR": "法国",
+    "NL": "荷兰",
+    "CA": "加拿大",
+    "AU": "澳大利亚",
+    "CN": "中国",
+    "RU": "俄罗斯",
+    "IN": "印度",
+    "BR": "巴西",
+    "ZA": "南非",
+}
+
 def safe_json(file_path: Path, default=None):
     if not file_path.exists():
         return default or {}
@@ -95,56 +116,20 @@ def get_geo_info(ip: str, timeout=1.8) -> dict:
         return geo_cache[ip]["data"]
 
     methods = [
-        {
-            "name": "ipinfo",
-            "url": f"https://ipinfo.io/{ip}/json",
-            "headers": {"User-Agent": "cf-hunter/1.0"},
-            "parser": lambda d: {
-                "cc": d.get("country", "??"),
-                "country": d.get("country", "未知"),
-                "city": d.get("city", ""),
-                "source": "ipinfo"
-            }
-        },
-        {
-            "name": "ipapi.co",
-            "url": f"https://ipapi.co/{ip}/json/",
-            "parser": lambda d: {
-                "cc": d.get("country_code", "??"),
-                "country": d.get("country_name", "未知"),
-                "city": d.get("city", ""),
-                "source": "ipapi.co"
-            }
-        },
-        {
-            "name": "ipwhois",
-            "url": f"https://ipwhois.app/json/{ip}",
-            "parser": lambda d: {
-                "cc": d.get("country_code", "??"),
-                "country": d.get("country", "未知"),
-                "city": d.get("city", ""),
-                "source": "ipwhois"
-            }
-        },
-        {
-            "name": "cf_trace",
-            "url": f"http://{ip}/cdn-cgi/trace",
-            "parser": lambda text: {
-                "cc": "??",
-                "country": f"CF-Colo: {text.split('colo=')[1].split('\n')[0] if 'colo=' in text else '未知'}",
-                "city": "",
-                "source": "cf_trace"
-            }
-        }
+        {"name": "ipinfo", "url": f"https://ipinfo.io/{ip}/json",
+         "headers": {"User-Agent": "cf-hunter/1.0"},
+         "parser": lambda d: {"cc": d.get("country", "??"), "country": d.get("country", "未知"), "city": d.get("city", ""), "source": "ipinfo"}},
+        {"name": "ipapi.co", "url": f"https://ipapi.co/{ip}/json/",
+         "parser": lambda d: {"cc": d.get("country_code", "??"), "country": d.get("country_name", "未知"), "city": d.get("city", ""), "source": "ipapi.co"}},
+        {"name": "ipwhois", "url": f"https://ipwhois.app/json/{ip}",
+         "parser": lambda d: {"cc": d.get("country_code", "??"), "country": d.get("country", "未知"), "city": d.get("city", ""), "source": "ipwhois"}},
+        {"name": "cf_trace", "url": f"http://{ip}/cdn-cgi/trace",
+         "parser": lambda text: {"cc": "??", "country": f"CF-Colo: {text.split('colo=')[1].split('\n')[0] if 'colo=' in text else '未知'}", "city": "", "source": "cf_trace"}}
     ]
 
     for method in methods:
         try:
-            r = requests.get(
-                method["url"],
-                timeout=timeout,
-                headers=method.get("headers", {"User-Agent": "cf-hunter/1.0"})
-            )
+            r = requests.get(method["url"], timeout=timeout, headers=method.get("headers", {"User-Agent": "cf-hunter/1.0"}))
             if r.status_code != 200:
                 continue
             if method["name"] == "cf_trace":
@@ -155,7 +140,6 @@ def get_geo_info(ip: str, timeout=1.8) -> dict:
             return data
         except Exception:
             continue
-
     return {"cc": "??", "country": "获取失败", "city": "", "source": "failed"}
 
 class IPPoolManager:
@@ -233,13 +217,7 @@ def evolution_engine():
 
             blacklist = IPPoolManager.get_blacklist()
             seen = set()
-            unique_targets = []
-            for t in targets:
-                ip = t["ip"]
-                if ip in blacklist or ip in seen:
-                    continue
-                seen.add(ip)
-                unique_targets.append(t)
+            unique_targets = [t for t in targets if t["ip"] not in blacklist and t["ip"] not in seen and not seen.add(t["ip"])]
             random.shuffle(unique_targets)
 
             results = []
@@ -268,12 +246,11 @@ def evolution_engine():
                                 size += len(chunk)
                                 if time.perf_counter() - st > cfg["download_timeout"]:
                                     break
-                            speed = size / (time.perf_counter() - st) / 1024 / 1024
+                            speed = size / (time.perf_counter() - st) / 1024 / 1024 if (time.perf_counter() - st) > 0 else 0
                         except Exception:
                             pass
 
                         geo = get_geo_info(ip)
-
                         score = round(100 - tcp_ms / 4 + min(speed * 6, 50), 1)
 
                         result = {
@@ -315,7 +292,7 @@ def evolution_engine():
                 safe_write_json(FILES["results"], {
                     "last_run": datetime.now().strftime("%H:%M:%S"),
                     "winner": sorted_results[0] if sorted_results else None,
-                    "table": sorted_results[:80],
+                    "table": sorted_results[:100],
                     "is_full": is_full_scan,
                     "mode": cfg["mode"]
                 })
@@ -332,12 +309,15 @@ def evolution_engine():
 
         time.sleep(6)
 
-# 启动后台线程
+# 启动后台
 if "evolution_started" not in st.session_state:
     threading.Thread(target=evolution_engine, daemon=True).start()
     st.session_state.evolution_started = True
 
-# Streamlit 界面
+# ──────────────────────────────────────────────────────────
+# 前端界面
+# ──────────────────────────────────────────────────────────
+
 st.set_page_config(page_title="Cloudflare 猎手 · 进化版", page_icon="🧬", layout="wide")
 
 with st.sidebar:
@@ -355,12 +335,7 @@ with st.sidebar:
 
     if st.button("保存配置并重启", type="primary"):
         new_cfg = cfg.copy()
-        new_cfg.update({
-            "mode": new_mode,
-            "host": host,
-            "port": port,
-            "max_workers": max_workers
-        })
+        new_cfg.update({"mode": new_mode, "host": host, "port": port, "max_workers": max_workers})
         safe_write_json(FILES["config"], new_cfg)
         if FILES["results"].exists():
             FILES["results"].unlink()
@@ -375,6 +350,7 @@ if not data or not data.get("winner"):
     st.info("正在启动进化引擎... 初次扫描预计 10~40 秒")
     time.sleep(5)
     st.rerun()
+
 else:
     winner = data["winner"]
     st.title("🧬 Cloudflare 猎手 · 进化版")
@@ -382,33 +358,39 @@ else:
     tag = "🚀 全量扫描中" if data.get("is_full") else "⚡ 实时优化"
     st.markdown(f"### 当前最强节点：`{winner['ip']}`　　{tag}")
 
-    cols = st.columns([2.5, 1.2, 1.2, 1.5])
+    cols = st.columns([3, 1.4, 1.4, 1.8])
     cols[0].metric("综合评分", f"{winner['score']:.1f}")
     cols[1].metric("延迟", f"{winner['avg']:.1f} ms")
-    cols[2].metric("速度", f"{winner['speed']:.2f} MB/s")
-    cols[3].metric("地区", f"{winner['cc']} {winner['country']}")
+    cols[2].metric("下载速度", f"{winner['speed']:.2f} MB/s")
+    cols[3].metric("地区", f"{winner['cc']} {COUNTRY_MAP.get(winner['cc'], '未知')}")
 
     st.divider()
 
-    st.subheader(f"实时排行榜（当前策略：{data['mode']}） 前 {len(data['table'])} 名")
+    st.subheader(f"实时排行榜（策略：{data['mode']}） - 前 10 名")
 
-    df = pd.DataFrame(data["table"])
+    df = pd.DataFrame(data["table"][:10])
+
     df["来源"] = df["src"]
-    df["地区"] = df["cc"] + " " + df["country"]
+    df["地区"] = df.apply(
+        lambda row: f"{row['cc']} {COUNTRY_MAP.get(row['cc'], '未知')}"
+        if row['cc'] != "??" else "?? 未知",
+        axis=1
+    )
 
     st.dataframe(
         df,
         column_order=["score", "来源", "ip", "地区", "avg", "speed", "last_test"],
         column_config={
-            "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=140),
+            "score": st.column_config.ProgressColumn("评分", min_value=0, max_value=140, format="%d"),
             "avg": st.column_config.NumberColumn("延迟 ms", format="%.1f"),
             "speed": st.column_config.NumberColumn("速度 MB/s", format="%.2f"),
+            "ip": st.column_config.TextColumn("IP地址", width="medium"),
+            "地区": st.column_config.TextColumn("地区", width="medium"),
         },
         use_container_width=True,
         hide_index=True
     )
 
-    st.caption(f"最后更新: {data['last_run']}　｜　每5分钟进行一次全量扫描")
-
+    st.caption(f"最后更新: {data['last_run']}　｜　每5分钟全量扫描一次　｜　显示前10名")
     time.sleep(5)
     st.rerun()
