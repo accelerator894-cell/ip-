@@ -22,11 +22,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ===========================
 st.set_page_config(page_title="VLESS 猎手进化版", page_icon="🧬", layout="wide")
 
-RESULT_FILE = "scan_results.json"   # 前端展示
-DB_FILE = "ip_database.json"        # 精英库 (老兵)
-CRAWLER_FILE = "crawler_pool.json"  # 普通爬虫池 (GitHub来源)
-NICHE_FILE = "niche_pool.json"      # 💎 冷门专用池 (黄金段位生成)
-CONFIG_FILE = "app_config.json"     # 配置
+RESULT_FILE = "scan_results.json"   
+DB_FILE = "ip_database.json"        
+CRAWLER_FILE = "crawler_pool.json"  
+NICHE_FILE = "niche_pool.json"      
+CONFIG_FILE = "app_config.json"     
 
 # 极速启动种子
 QUICK_SEEDS = [
@@ -34,8 +34,7 @@ QUICK_SEEDS = [
     "104.16.16.16", "104.24.24.24", "172.64.0.1", "104.18.18.18"
 ]
 
-# 💎 黄金冷门段位 (这些段位通常质量较高，但很少在公开列表刷屏)
-# 这里避开了最拥堵的 104.16.0.0/12 的大部分，选择了一些特定的切片
+# 💎 黄金冷门段位
 GOLDEN_SUBNETS = [
     "104.28.0.0/16", "172.67.128.0/17", "104.21.0.0/16", 
     "172.64.0.0/13", "103.21.244.0/22", "103.22.200.0/22",
@@ -54,11 +53,10 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ===========================
-# 2. 核心类定义
+# 2. 核心类定义 (保持原样，略有精简)
 # ===========================
 
 class IPDatabase:
-    """正式精英数据库"""
     def __init__(self, filepath):
         self.filepath = filepath
         self.lock = threading.Lock()
@@ -82,7 +80,7 @@ class IPDatabase:
 
     def update_ip(self, ip, stats):
         with self.lock:
-            if stats['score'] < 30: return # 门槛稍低一点，允许更多样本进入
+            if stats['score'] < 30: return 
             if ip not in self.data:
                 self.data[ip] = stats
             else:
@@ -99,7 +97,6 @@ class IPDatabase:
         return valid[:limit]
 
 class BasePool:
-    """池基类"""
     def __init__(self, filepath, max_size=20):
         self.filepath = filepath
         self.max_size = max_size
@@ -118,8 +115,7 @@ class BasePool:
             with open(self.filepath, "w") as f: json.dump(self.ips, f)
 
     def get_batch(self, batch_size=5):
-        with self.lock:
-            return self.ips[:batch_size]
+        with self.lock: return self.ips[:batch_size]
 
     def remove_batch(self, tested_ips):
         with self.lock:
@@ -127,12 +123,12 @@ class BasePool:
             self.save()
 
 class CrawlerPool(BasePool):
-    """普通爬虫池 (GitHub 来源)"""
     def fill_pool(self):
         if len(self.ips) >= self.max_size: return
         try:
+            # 使用更快的 CDN 地址或备用源
             url = "https://raw.githubusercontent.com/Alvin9999/new-pac/master/cloudflare.txt"
-            txt = requests.get(url, timeout=4).text
+            txt = requests.get(url, timeout=3).text
             found = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', txt)
             random.shuffle(found)
             with self.lock:
@@ -143,25 +139,18 @@ class CrawlerPool(BasePool):
         except: pass
 
 class NichePool(BasePool):
-    """💎 冷门优质池 (基于 CIDR 随机生成，不依赖公共列表)"""
     def fill_pool(self):
         if len(self.ips) >= self.max_size: return
-        
-        # 核心逻辑：从黄金段位中随机生成 IP
         new_ips = []
         target_count = self.max_size - len(self.ips)
-        
-        for _ in range(target_count + 5): # 多生成一点备用
+        for _ in range(target_count + 5):
             subnet_str = random.choice(GOLDEN_SUBNETS)
             try:
-                # 随机生成该网段下的一个 IP
                 network = ipaddress.ip_network(subnet_str, strict=False)
-                # 简单随机算法：网络地址 + 随机整数
                 random_int = random.randint(1, network.num_addresses - 2)
                 generated_ip = str(network.network_address + random_int)
                 new_ips.append(generated_ip)
             except: pass
-            
         with self.lock:
             for ip in new_ips:
                 if len(self.ips) >= self.max_size: break
@@ -169,7 +158,7 @@ class NichePool(BasePool):
         self.save()
 
 # ===========================
-# 3. 辅助函数
+# 3. 优化后的测试逻辑
 # ===========================
 
 def get_config():
@@ -185,10 +174,22 @@ def save_config(new_conf):
 
 def get_geo_info(ip):
     try:
-        r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp,hosting", timeout=1.5).json()
+        # 缩短 API 超时时间，因为这不是最关键的
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp,hosting", timeout=1.0).json()
         cc = r.get("countryCode", "US")
         return {"cc": cc, "gpt": "✅" if cc not in ['CN','HK','RU','IR','KP'] else "❌", "is_native": not r.get("hosting", True)}
     except: return {"cc": "Unk", "gpt": "❓", "is_native": False}
+
+def quick_socket_check(ip, port=443):
+    """🔥 极速预检：只尝试连接一次，超时极短。通了再做后续测试。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.4) # 400ms 握手超时，超时说明线路不行
+        s.connect((ip, port))
+        s.close()
+        return True
+    except:
+        return False
 
 def ping0_test(ip, port=443, count=4):
     lats, success = [], 0
@@ -222,13 +223,29 @@ def classify_ip(p0, speed, geo):
     return tags
 
 # ===========================
-# 4. 后台进化线程 (双核驱动)
+# 4. 后台进化线程 (异步流水线优化)
 # ===========================
+
+def update_frontend_json(mode, winner, table, std_pool_len, niche_pool_len):
+    """辅助函数：安全写入前端文件"""
+    try:
+        state = {
+            "last_run": datetime.now().strftime("%H:%M:%S"),
+            "mode": mode,
+            "winner": winner,
+            "table": table,
+            "std_pool": std_pool_len,
+            "niche_pool": niche_pool_len
+        }
+        tmp = RESULT_FILE + ".tmp"
+        with open(tmp, "w", encoding='utf-8') as f: json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, RESULT_FILE)
+    except: pass
 
 def background_worker():
     db = IPDatabase(DB_FILE)
-    std_pool = CrawlerPool(CRAWLER_FILE, max_size=20)   # 普通池
-    niche_pool = NichePool(NICHE_FILE, max_size=20)     # 💎 冷门池
+    std_pool = CrawlerPool(CRAWLER_FILE, max_size=20)
+    niche_pool = NichePool(NICHE_FILE, max_size=20)
     
     while True:
         try:
@@ -237,57 +254,69 @@ def background_worker():
             
             scan_targets = []
             
-            # 1. 种子 (保底)
+            # 1. 种子 (高优先级)
             scan_targets.extend([{"ip": ip, "src": "⚡ 种子"} for ip in QUICK_SEEDS])
             
-            # 2. 历史精英 (优选)
+            # 2. 历史精英
             top_db = db.get_top_ips(12)
             for item in top_db:
                 scan_targets.append({"ip": item['ip'], "src": "📂 历史"})
             
-            # 3. 填充并获取新 IP (双源获取)
-            std_pool.fill_pool()
-            niche_pool.fill_pool()
+            # 3. 填充爬虫池
+            # 使用 threading 避免爬虫动作卡住测试
+            threading.Thread(target=std_pool.fill_pool).start()
+            threading.Thread(target=niche_pool.fill_pool).start()
             
-            # 从普通池拿 6 个
-            for ip in std_pool.get_batch(6):
+            # 这里的数量可以适当增加，因为我们有快速预检了
+            for ip in std_pool.get_batch(8):
                 scan_targets.append({"ip": ip, "src": "🕷️ 爬虫"})
-                
-            # 从冷门池拿 6 个 (高优先级)
-            for ip in niche_pool.get_batch(6):
+            for ip in niche_pool.get_batch(8):
                 scan_targets.append({"ip": ip, "src": "💎 冷门"})
             
             unique_targets = {v['ip']:v for v in scan_targets}.values()
             
-            # --- 执行并发测试 ---
+            # --- 并发测试流水线 ---
             current_results = []
             tested_ips_std = [] 
             tested_ips_niche = []
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
+            # 动态调整测试负载：如果是第一次运行，减少下载量以加快出图速度
+            is_warmup = not os.path.exists(RESULT_FILE)
+            download_bytes = 50000 if is_warmup else 200000 # 50KB vs 200KB
+            
+            workers = 30 # 加大并发，反正有预检
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
                 def task(target):
                     ip = target['ip']
                     port = cfg.get('port', 443)
                     
+                    # 🔥 阶段1: 极速预检 (如果不通，直接 Pass)
+                    if not quick_socket_check(ip, port):
+                        # 记录失败也要清理池子
+                        if target['src'] == "🕷️ 爬虫": tested_ips_std.append(ip)
+                        if target['src'] == "💎 冷门": tested_ips_niche.append(ip)
+                        return None
+                    
+                    # 阶段2: 详细 Ping
                     p0 = ping0_test(ip, port)
                     if p0['loss'] > 40: return None 
                     
+                    # 阶段3: 测速 (动态大小)
                     speed = 0.0
                     try:
                         st_t = time.perf_counter()
-                        url = f"http://{ip}/__down?bytes=200000"
-                        r = requests.get(url, headers={"Host": "speed.cloudflare.com"}, timeout=2.5)
+                        url = f"http://{ip}/__down?bytes={download_bytes}"
+                        r = requests.get(url, headers={"Host": "speed.cloudflare.com"}, timeout=2.0) # 缩短超时
                         if r.status_code == 200:
+                            # 还原为 MB/s (近似值，因为只下了小包)
                             speed = (len(r.content)/1024/1024) / (time.perf_counter() - st_t)
                     except: pass
                     
                     geo = get_geo_info(ip)
-                    
-                    # 冷门 IP 给予微小的分数加成，鼓励使用冷门 IP
                     bonus = 5 if target['src'] == "💎 冷门" else 0
                     score = calculate_score(mode, p0, speed, geo) + bonus
                     
-                    # 记录来源以便后续清理池子
                     if target['src'] == "🕷️ 爬虫": tested_ips_std.append(ip)
                     if target['src'] == "💎 冷门": tested_ips_niche.append(ip)
 
@@ -300,36 +329,28 @@ def background_worker():
                     }
 
                 futs = [ex.submit(task, t) for t in unique_targets]
+                
+                # 🔥 实时反馈循环：只要有一个结果出来，就尝试更新前端，不等全部跑完
                 for f in concurrent.futures.as_completed(futs):
                     r = f.result()
                     if r: 
                         current_results.append(r)
                         db.update_ip(r['ip'], r)
+                        
+                        # 排序并提取冠军
+                        temp_results = sorted(current_results, key=lambda x: x['score'], reverse=True)
+                        winner = temp_results[0]
+                        
+                        # 立即刷新前端文件 (让用户马上看到结果)
+                        update_frontend_json(mode, winner, temp_results[:50], len(std_pool.ips), len(niche_pool.ips))
 
-            # --- 清理池子 ---
+            # --- 本轮结束后的清理与保存 ---
             if tested_ips_std: std_pool.remove_batch(tested_ips_std)
             if tested_ips_niche: niche_pool.remove_batch(tested_ips_niche)
-
-            # --- 保存状态 ---
-            if current_results:
-                db.save()
-                current_results.sort(key=lambda x: x['score'], reverse=True)
-                
-                state = {
-                    "last_run": datetime.now().strftime("%H:%M:%S"),
-                    "mode": mode,
-                    "winner": current_results[0],
-                    "table": current_results[:50],
-                    "std_pool": len(std_pool.ips),
-                    "niche_pool": len(niche_pool.ips)
-                }
-                
-                tmp = RESULT_FILE + ".tmp"
-                with open(tmp, "w", encoding='utf-8') as f: json.dump(state, f, ensure_ascii=False)
-                os.replace(tmp, RESULT_FILE)
+            db.save()
 
         except Exception as e: print(f"Err: {e}")
-        time.sleep(8) 
+        time.sleep(5) 
 
 if "bg_thread" not in st.session_state:
     t = threading.Thread(target=background_worker, daemon=True)
@@ -337,7 +358,7 @@ if "bg_thread" not in st.session_state:
     st.session_state.bg_thread = True
 
 # ===========================
-# 5. 前端 UI
+# 5. 前端 UI (带实时刷新说明)
 # ===========================
 with st.sidebar:
     st.header("🛠️ 配置控制台")
@@ -356,9 +377,9 @@ with st.sidebar:
         save_config({"mode": new_mode, "host": new_host, "port": new_port})
         st.toast(f"✅ 策略更新: {new_mode}", icon="🔀")
         if os.path.exists(RESULT_FILE): os.remove(RESULT_FILE)
-        time.sleep(1); st.rerun()
+        time.sleep(0.5); st.rerun()
 
-st.title("🧬 Cloudflare 猎手进化版 (双核驱动)")
+st.title("🧬 Cloudflare 猎手进化版 (极速启动)")
 
 if os.path.exists(RESULT_FILE):
     try:
@@ -376,10 +397,9 @@ if os.path.exists(RESULT_FILE):
         st.divider()
         st.subheader(f"🧬 基因库 (策略: {data['mode']})")
         
-        # 显示双池状态
         col_p1, col_p2 = st.columns(2)
-        col_p1.info(f"🕷️ 普通爬虫池: {data.get('std_pool', 0)} / 20 (GitHub)")
-        col_p2.success(f"💎 冷门优质池: {data.get('niche_pool', 0)} / 20 (黄金段位生成)")
+        col_p1.info(f"🕷️ 普通池: {data.get('std_pool', 0)} / 20")
+        col_p2.success(f"💎 冷门池: {data.get('niche_pool', 0)} / 20")
         
         df = pd.DataFrame(data['table'])
         if 'tags' in df.columns: df['tags'] = df['tags'].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x))
@@ -394,8 +414,13 @@ if os.path.exists(RESULT_FILE):
             },
             use_container_width=True, hide_index=True
         )
-    except: st.warning("🔄 数据刷新中..."); time.sleep(1); st.rerun()
+    except: 
+        # 即使读失败也不要卡住，稍等重试
+        time.sleep(0.5); st.rerun()
 else:
-    st.info("🧬 初始化双核引擎并进行首轮测试..."); time.sleep(2); st.rerun()
+    # 极简启动画面
+    st.info("🚀 正在极速连接中... (通常只需 1-3 秒)")
+    time.sleep(1); st.rerun()
 
-time.sleep(5); st.rerun()
+# 保持自动刷新，但频率略微降低以减轻前端负担
+time.sleep(3); st.rerun()
