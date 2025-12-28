@@ -1,150 +1,150 @@
-# ================= Cloudflare Hunter Scheduler =================
-# 工程级 IP 调度 + 进化系统
-
-import streamlit as st
-import requests, time, json, random, re, socket, threading, subprocess
-import pandas as pd
-from collections import defaultdict, deque
-from datetime import datetime
+import time, json, random, socket, threading
 from pathlib import Path
-import concurrent.futures
-import ipaddress
+from collections import defaultdict, Counter
+import requests
 
-# ================= 基础 =================
-BASE = Path(__file__).parent
-FILES = {
-    "db": BASE / "ip_db.json",
-    "state": BASE / "runtime_state.json",
-    "config": BASE / "config.json",
+BASE = Path(".")
+DB_FILE = BASE / "ip_db.json"
+STATE_FILE = BASE / "state.json"
+FAIL_FILE = BASE / "fail_db.json"
+
+UUID = "填写你的UUID"
+REALITY_PUB = "填写你的Reality公钥"
+REALITY_SID = "填写你的short_id"
+SNI = "www.cloudflare.com"
+
+SCENES = ["normal", "gpt", "stream"]
+
+FINGERPRINT = {
+    "normal": "chrome",
+    "gpt": "firefox",
+    "stream": "safari"
 }
 
-def load(p, d):
-    if not p.exists(): return d
-    try: return json.loads(p.read_text())
-    except: return d
+SEEDS = [
+    "104.19.19.19", "104.18.20.126",
+    "172.64.198.1", "172.67.1.1"
+]
 
-def save(p, d):
-    p.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+def load(path, default):
+    if not path.exists():
+        return default
+    return json.loads(path.read_text())
 
-# ================= 配置 =================
-CONFIG = load(FILES["config"], {
-    "mode": "normal",
-    "switch_threshold": 70,
-    "hold_threshold": 85,
-    "max_workers": 50
-})
+def save(path, data):
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-# ================= 稳定 EMA =================
-def ema(old, new, a=0.3):
-    return new if old is None else old * (1 - a) + new * a
-
-# ================= TLS / Reality 探测 =================
-def tls_capable(ip):
-    try:
-        p = subprocess.run(
-            ["openssl", "s_client", "-connect", f"{ip}:443",
-             "-servername", "www.cloudflare.com", "-alpn", "h2"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=3
-        )
-        out = p.stdout.decode(errors="ignore")
-        return "TLSv1.3" in out and "ALPN protocol: h2" in out
-    except:
-        return False
-
-# ================= IP 测试 =================
+# ---------- IP 测试 ----------
 def test_ip(ip):
-    t0 = time.time()
     try:
-        s = socket.create_connection((ip, 443), timeout=1)
+        s = socket.socket()
+        s.settimeout(1)
+        t0 = time.time()
+        s.connect((ip, 443))
         latency = (time.time() - t0) * 1000
         s.close()
 
         r = requests.get(
-            f"http://{ip}/__down?bytes=150000",
-            headers={"Host": "speed.cloudflare.com"},
-            timeout=4, stream=True
+            f"http://{ip}/cdn-cgi/trace",
+            headers={"Host": SNI},
+            timeout=2
         )
-        size = sum(len(c) for c in r.iter_content(65536))
-        speed = size / 1024 / 1024 / 4
+        colo = "UNK"
+        if "colo=" in r.text:
+            colo = r.text.split("colo=")[1].split("\n")[0]
 
-        score = round(100 - latency / 4 + min(speed * 6, 50), 1)
-        return latency, speed, score
+        return latency, colo
     except:
-        return None, None, 0
+        return None, None
 
-# ================= 调度核心 =================
-def scheduler_loop():
-    db = load(FILES["db"], {})
-    state = load(FILES["state"], {"current_ip": None})
+# ---------- 稳定度模型 ----------
+def colo_stability(colos):
+    if not colos:
+        return 0
+    c = Counter(colos)
+    return c.most_common(1)[0][1] / len(colos)
+
+def health_score(h):
+    return round(
+        colo_stability(h["colo"]) * 0.4 +
+        (1 - min(sum(h["latency"]) / len(h["latency"]) / 200, 1)) * 0.3 +
+        min(h["success"] / max(h["success"] + h["fail"], 1), 1) * 0.3,
+        3
+    )
+
+# ---------- 是否切 IP ----------
+def should_switch(cur, cand):
+    if cur is None:
+        return True
+    if cur["health"] >= 0.85:
+        return False
+    return cand["health"] - cur["health"] >= 0.15
+
+# ---------- NekoBox 输出 ----------
+def export_nekobox(scene, ip):
+    node = {
+        "type": "vless",
+        "tag": f"CF-{scene.upper()}",
+        "server": ip,
+        "server_port": 443,
+        "uuid": UUID,
+        "tls": {
+            "enabled": True,
+            "server_name": SNI,
+            "utls": {
+                "enabled": True,
+                "fingerprint": FINGERPRINT[scene]
+            },
+            "reality": {
+                "enabled": True,
+                "public_key": REALITY_PUB,
+                "short_id": REALITY_SID
+            }
+        },
+        "transport": {"type": "tcp"}
+    }
+    save(BASE / f"nekobox_{scene}.json", node)
+
+# ---------- 主循环 ----------
+def scheduler():
+    db = load(DB_FILE, {})
+    state = load(STATE_FILE, {})
+    fail = load(FAIL_FILE, defaultdict(int))
 
     while True:
-        current = state.get("current_ip")
-
-        # 判断是否需要换 IP
-        if current:
-            stable = db[current]["stable"]
-            if stable >= CONFIG["hold_threshold"]:
-                time.sleep(5)
+        for ip in SEEDS:
+            lat, colo = test_ip(ip)
+            if not lat:
+                fail[ip] = fail.get(ip, 0) + 1
                 continue
 
-        # 选择候选
-        candidates = sorted(
-            db.items(),
-            key=lambda x: x[1]["stable"],
-            reverse=True
-        )
+            h = db.get(ip, {
+                "latency": [],
+                "colo": [],
+                "success": 0,
+                "fail": 0
+            })
 
-        for ip, meta in candidates:
-            if meta["stable"] < CONFIG["switch_threshold"]:
-                continue
-            state["current_ip"] = ip
-            save(FILES["state"], state)
-            break
+            h["latency"].append(lat)
+            h["latency"] = h["latency"][-10:]
+            h["colo"].append(colo)
+            h["colo"] = h["colo"][-10:]
+            h["success"] += 1
 
-        time.sleep(5)
+            h["health"] = health_score(h)
+            db[ip] = h
 
-# ================= 主引擎 =================
-def engine():
-    db = load(FILES["db"], {})
+            for scene in SCENES:
+                cur_ip = state.get(scene)
+                cur = db.get(cur_ip) if cur_ip else None
+                if should_switch(cur, h):
+                    state[scene] = ip
+                    export_nekobox(scene, ip)
 
-    while True:
-        ips = list(db.keys())
-        with concurrent.futures.ThreadPoolExecutor(40) as ex:
-            for ip, (lat, spd, score) in zip(ips, ex.map(test_ip, ips)):
-                if score <= 0: continue
-
-                meta = db.setdefault(ip, {})
-                meta["score"] = score
-                meta["stable"] = ema(meta.get("stable"), score)
-                meta["last"] = datetime.now().strftime("%H:%M:%S")
-
-                if meta.get("tls") is None:
-                    meta["tls"] = tls_capable(ip)
-
-                meta["tags"] = {
-                    "gpt": meta["tls"] and meta["stable"] > 80,
-                    "stream": spd > 3
-                }
-
-        save(FILES["db"], db)
+        save(DB_FILE, db)
+        save(STATE_FILE, state)
+        save(FAIL_FILE, fail)
         time.sleep(10)
 
-# ================= UI =================
-if "run" not in st.session_state:
-    threading.Thread(target=engine, daemon=True).start()
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    st.session_state.run = True
-
-st.title("🧬 Cloudflare Hunter · 调度器")
-
-db = load(FILES["db"], {})
-state = load(FILES["state"], {})
-
-st.metric("当前使用 IP", state.get("current_ip", "无"))
-
-df = pd.DataFrame([
-    {"ip": ip, **meta} for ip, meta in db.items()
-])
-
-st.dataframe(df, use_container_width=True)
+if __name__ == "__main__":
+    scheduler()
