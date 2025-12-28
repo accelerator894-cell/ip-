@@ -10,14 +10,14 @@ DB_FILE = BASE / "ip_db.json"
 STATE_FILE = BASE / "state.json"
 FAIL_FILE = BASE / "fail_db.json"
 
-UUID = "填写你的UUID"
-REALITY_PUB = "填写你的Reality公钥"
-REALITY_SID = "填写你的shortid"
-SNI = "www.cloudflare.com"
+UUID = "123e4567-e89b-12d3-a456-426614174000"       # 你的 UUID
+REALITY_PUB = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A..."  # 你的 Reality 公钥
+REALITY_SID = "abcd1234efgh5678"                    # 你的 Short ID
+SNI = "speed.cloudflare.com"                        # 之前的 host
 
-SCENES = ["normal", "gpt", "stream"]
-FINGERPRINT = {"normal": "chrome", "gpt": "firefox", "stream": "safari"}
-SEEDS = ["104.19.19.19", "104.18.20.126", "172.64.198.1", "172.67.1.1"]
+SCENES = ["normal", "gpt", "stream", "custom"]
+FINGERPRINT = {"normal": "chrome", "gpt": "firefox", "stream": "safari", "custom": "chrome"}
+SEEDS = ["104.19.19.19", "104.18.20.126", "172.64.198.1", "172.67.1.1", "104.21.32.13"]
 
 # ------------------ 文件操作 ------------------
 def load(path, default):
@@ -114,11 +114,17 @@ def scheduler():
             db[ip] = h
 
             for scene in SCENES:
+                # 场景筛选规则
+                if scene == "gpt" and speed < 1.0:  # GPT 独享要求速度快
+                    continue
+                if scene == "stream" and lat > 150:  # 流媒体低延迟
+                    continue
                 cur_ip = state.get(scene)
                 cur = db.get(cur_ip) if cur_ip else None
                 if should_switch(cur,h):
                     state[scene] = ip
                     export_nekobox(scene, ip)
+
         save(DB_FILE,db)
         save(STATE_FILE,state)
         save(FAIL_FILE,fail)
@@ -130,21 +136,26 @@ if "started" not in st.session_state:
     st.session_state.started = True
 
 st.set_page_config(page_title="Cloudflare 猎手", layout="wide")
-st.title("🧬 Cloudflare IP 猎手 · Streamlit版")
+st.title("🧬 Cloudflare IP 猎手 · 多场景自动筛选")
 
 db = load(DB_FILE,{})
 state = load(STATE_FILE,{})
 
-# 构造 DataFrame，保证列存在
+# 构造 DataFrame，填补缺失数据
 rows = []
 for ip, v in db.items():
+    latency = round(v.get("latency")[-1],1) if v.get("latency") else 999
+    speed = round(v.get("speed")[-1],2) if v.get("speed") else 0.0
+    colo = v.get("colo")[-1] if v.get("colo") else "UNK"
+    source = v.get("source","未知")
+    health = round(v.get("health",0.0),3)
     rows.append({
         "IP": ip,
-        "评分": v.get("health",0),
-        "延迟(ms)": round(v.get("latency")[-1],1) if v.get("latency") else 0,
-        "速度(MB/s)": round(v.get("speed")[-1],2) if v.get("speed") else 0,
-        "来源": v.get("source","未知"),
-        "Colo": v.get("colo")[-1] if v.get("colo") else "UNK"
+        "评分": health,
+        "延迟(ms)": latency,
+        "速度(MB/s)": speed,
+        "来源": source,
+        "Colo": colo
     })
 
 if rows:
@@ -152,9 +163,10 @@ if rows:
 else:
     df = pd.DataFrame(columns=["IP","评分","延迟(ms)","速度(MB/s)","来源","Colo"])
 
+st.subheader("前10优质节点")
 st.dataframe(df, use_container_width=True)
 
-st.subheader("NekoBox 下载链接")
+st.subheader("NekoBox 下载中心")
 for scene in SCENES:
     ip = state.get(scene,"尚未选择")
     st.markdown(f"**{scene.upper()}** 当前节点: {ip}")
@@ -162,4 +174,4 @@ for scene in SCENES:
     if file_path.exists():
         st.download_button(f"下载 {scene.upper()}", data=file_path.read_text(), file_name=file_path.name)
 
-st.caption("后台每10秒自动更新 IP 健康度、Colo 稳定性和 NekoBox 配置")
+st.caption("后台每10秒自动更新 IP 健康度、Colo稳定性、速度和 NekoBox 配置，按场景自动筛选最优 IP")
