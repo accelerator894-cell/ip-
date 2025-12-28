@@ -1,33 +1,51 @@
 import streamlit as st
 import pandas as pd
-import time, threading, random, socket, json
+import time
+import threading
+import random
+import socket
+import json
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Dict, List, Tuple, Optional, Any
 import concurrent.futures
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import logging
 
-# ------------------ 配置 ------------------
+# ==================== 配置部分 ====================
 @dataclass
 class Config:
+    """应用配置"""
     BASE_DIR: Path = Path(".")
     DB_FILE: Path = BASE_DIR / "data" / "ip_db.json"
     STATE_FILE: Path = BASE_DIR / "data" / "state.json"
     FAIL_FILE: Path = BASE_DIR / "data" / "fail_db.json"
     LOG_FILE: Path = BASE_DIR / "data" / "app.log"
     
+    # 连接参数
     UUID: str = "123e4567-e89b-12d3-a456-426614174000"
     REALITY_PUB: str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A..."
     REALITY_SID: str = "abcd1234efgh5678"
     SNI: str = "speed.cloudflare.com"
     
+    # 场景配置
     SCENES: List[str] = ["normal", "gpt", "stream", "custom"]
-    FINGERPRINT: Dict[str, str] = {"normal": "chrome", "gpt": "firefox", 
-                                  "stream": "safari", "custom": "chrome"}
-    SEEDS: List[str] = ["104.19.19.19", "104.18.20.126", "172.64.198.1", 
-                       "172.67.1.1", "104.21.32.13"]
+    FINGERPRINT: Dict[str, str] = {
+        "normal": "chrome", 
+        "gpt": "firefox", 
+        "stream": "safari", 
+        "custom": "chrome"
+    }
+    
+    # 种子IP
+    SEEDS: List[str] = [
+        "104.19.19.19", 
+        "104.18.20.126", 
+        "172.64.198.1", 
+        "172.67.1.1", 
+        "104.21.32.13"
+    ]
     
     # 测试参数
     TEST_PORT: int = 443
@@ -39,15 +57,21 @@ class Config:
     WEIGHT_COLO: float = 0.4
     WEIGHT_LATENCY: float = 0.3
     WEIGHT_SUCCESS: float = 0.3
+    
+    # 场景特定规则
+    GPT_MIN_SPEED: float = 1.0  # MB/s
+    STREAM_MAX_LATENCY: float = 150  # ms
+    HEALTH_SWITCH_THRESHOLD: float = 0.15
+    HEALTH_GOOD_THRESHOLD: float = 0.85
 
 config = Config()
 
-# 创建数据目录
+# 创建必要目录
 config.BASE_DIR.mkdir(exist_ok=True)
 (config.BASE_DIR / "data").mkdir(exist_ok=True)
 (config.BASE_DIR / "profiles").mkdir(exist_ok=True)
 
-# 日志配置
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -58,9 +82,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ------------------ 数据类 ------------------
+# ==================== 数据模型 ====================
 @dataclass
 class IPStats:
+    """IP统计数据结构"""
     latency: List[float]
     colo: List[str]
     speed: List[float]
@@ -71,14 +96,18 @@ class IPStats:
     health: float = 0.0
     
     def to_dict(self) -> Dict:
+        """转换为字典"""
         return asdict(self)
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'IPStats':
+        """从字典创建实例"""
         return cls(**data)
 
-# ------------------ 文件操作 ------------------
+# ==================== 文件操作 ====================
 class DataManager:
+    """数据文件管理"""
+    
     @staticmethod
     def load_json(path: Path, default: Any = None) -> Any:
         """加载JSON文件，带错误处理"""
@@ -95,7 +124,6 @@ class DataManager:
     def save_json(path: Path, data: Any) -> bool:
         """保存JSON文件，带错误处理"""
         try:
-            # 确保目录存在
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -106,22 +134,28 @@ class DataManager:
     
     @staticmethod
     def load_ip_db() -> Dict[str, Dict]:
+        """加载IP数据库"""
         return DataManager.load_json(config.DB_FILE, {})
     
     @staticmethod
     def save_ip_db(data: Dict) -> bool:
+        """保存IP数据库"""
         return DataManager.save_json(config.DB_FILE, data)
     
     @staticmethod
     def load_state() -> Dict[str, str]:
+        """加载状态数据"""
         return DataManager.load_json(config.STATE_FILE, {})
     
     @staticmethod
     def save_state(data: Dict) -> bool:
+        """保存状态数据"""
         return DataManager.save_json(config.STATE_FILE, data)
 
-# ------------------ IP 测试 ------------------
+# ==================== IP测试模块 ====================
 class IPTester:
+    """IP测试器"""
+    
     @staticmethod
     def test_single_ip(ip: str) -> Tuple[Optional[float], Optional[str], float, str]:
         """测试单个IP的性能"""
@@ -161,8 +195,10 @@ class IPTester:
                     results[ip] = (None, None, 0, "超时")
         return results
 
-# ------------------ 健康度模型 ------------------
+# ==================== 健康度计算 ====================
 class HealthScorer:
+    """健康度评分器"""
+    
     @staticmethod
     def calculate_colo_stability(colos: List[str]) -> float:
         """计算Colo稳定性"""
@@ -178,7 +214,6 @@ class HealthScorer:
         if not latencies:
             return 0.0
         avg_latency = sum(latencies[-10:]) / len(latencies[-10:])
-        # 200ms为基准，延迟越低分数越高
         return max(0.0, 1.0 - min(avg_latency / 200, 1.0))
     
     @staticmethod
@@ -218,22 +253,24 @@ class HealthScorer:
             return True
             
         # 场景特定规则
-        if scene == "gpt" and candidate_stats.speed[-1] < 1.0:
+        if scene == "gpt" and candidate_stats.speed[-1] < config.GPT_MIN_SPEED:
             return False
-        if scene == "stream" and candidate_stats.latency[-1] > 150:
+        if scene == "stream" and candidate_stats.latency[-1] > config.STREAM_MAX_LATENCY:
             return False
             
         # 健康度提升超过阈值或当前健康度过低
         current_health = current_stats.health or 0.0
         candidate_health = candidate_stats.health
         
-        if current_health >= 0.85:
+        if current_health >= config.HEALTH_GOOD_THRESHOLD:
             return False
             
-        return candidate_health - current_health >= 0.15
+        return candidate_health - current_health >= config.HEALTH_SWITCH_THRESHOLD
 
-# ------------------ NekoBox 配置生成 ------------------
+# ==================== NekoBox配置生成 ====================
 class NekoBoxGenerator:
+    """NekoBox配置生成器"""
+    
     @staticmethod
     def generate_profile(scene: str, ip: str) -> Dict:
         """生成NekoBox配置文件"""
@@ -288,8 +325,10 @@ class NekoBoxGenerator:
             logger.error(f"保存配置文件失败: {e}")
             return None
 
-# ------------------ 核心管理器 ------------------
+# ==================== 核心管理器 ====================
 class IPHunterManager:
+    """IP猎手管理器"""
+    
     def __init__(self):
         self.db = DataManager.load_ip_db()
         self.state = DataManager.load_state()
@@ -348,9 +387,9 @@ class IPHunterManager:
                     stats = IPStats.from_dict(ip_data)
                     
                     # 场景过滤
-                    if scene == "gpt" and stats.speed and stats.speed[-1] < 1.0:
+                    if scene == "gpt" and stats.speed and stats.speed[-1] < config.GPT_MIN_SPEED:
                         continue
-                    if scene == "stream" and stats.latency and stats.latency[-1] > 150:
+                    if scene == "stream" and stats.latency and stats.latency[-1] > config.STREAM_MAX_LATENCY:
                         continue
                     
                     if stats.health > candidate_score:
@@ -448,8 +487,10 @@ class IPHunterManager:
                     status[scene] = {"ip": "无", "health": 0}
             return status
 
-# ------------------ Streamlit 前端 ------------------
+# ==================== Streamlit前端 ====================
 class StreamlitApp:
+    """Streamlit应用前端"""
+    
     def __init__(self):
         self.manager = IPHunterManager()
         self._init_session_state()
@@ -644,7 +685,15 @@ class StreamlitApp:
         🔄 最后刷新: {datetime.now().strftime('%H:%M:%S')}
         """)
 
-# ------------------ 应用入口 ------------------
+# ==================== 应用入口 ====================
+def main():
+    """主函数"""
+    try:
+        app = StreamlitApp()
+        app.run()
+    except Exception as e:
+        logger.error(f"应用启动失败: {e}")
+        st.error(f"应用启动失败: {e}")
+
 if __name__ == "__main__":
-    app = StreamlitApp()
-    app.run()
+    main()
