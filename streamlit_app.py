@@ -102,6 +102,23 @@ class IPStats:
     @classmethod
     def from_dict(cls, data: Dict) -> 'IPStats':
         """从字典创建实例"""
+        # 处理可能的缺失字段
+        defaults = {
+            "latency": [],
+            "colo": [],
+            "speed": [],
+            "success": 0,
+            "fail": 0,
+            "source": "",
+            "last_seen": "",
+            "health": 0.0
+        }
+        
+        # 确保所有字段都有值
+        for key, value in defaults.items():
+            if key not in data:
+                data[key] = value
+        
         return cls(**data)
 
 # ==================== 文件操作 ====================
@@ -135,7 +152,11 @@ class DataManager:
     @staticmethod
     def load_ip_db() -> Dict[str, Dict]:
         """加载IP数据库"""
-        return DataManager.load_json(config.DB_FILE, {})
+        data = DataManager.load_json(config.DB_FILE, {})
+        # 确保所有IP数据都有正确的结构
+        for ip in data:
+            data[ip] = IPStats.from_dict(data[ip]).to_dict()
+        return data
     
     @staticmethod
     def save_ip_db(data: Dict) -> bool:
@@ -151,6 +172,16 @@ class DataManager:
     def save_state(data: Dict) -> bool:
         """保存状态数据"""
         return DataManager.save_json(config.STATE_FILE, data)
+    
+    @staticmethod
+    def load_fail_db() -> Dict[str, int]:
+        """加载失败数据库"""
+        return DataManager.load_json(config.FAIL_FILE, {})
+    
+    @staticmethod
+    def save_fail_db(data: Dict) -> bool:
+        """保存失败数据库"""
+        return DataManager.save_json(config.FAIL_FILE, data)
 
 # ==================== IP测试模块 ====================
 class IPTester:
@@ -160,24 +191,28 @@ class IPTester:
     def test_single_ip(ip: str) -> Tuple[Optional[float], Optional[str], float, str]:
         """测试单个IP的性能"""
         try:
+            # 创建TCP套接字进行连接测试
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(config.TEST_TIMEOUT)
-                start_time = time.time()
+                start_time = time.perf_counter()  # 使用更高精度的计时器
                 s.connect((ip, config.TEST_PORT))
-                latency = (time.time() - start_time) * 1000
+                latency = (time.perf_counter() - start_time) * 1000  # 转换为毫秒
+                s.close()
                 
                 # 模拟数据（实际使用时应该获取真实数据）
-                colo = random.choice(["SFO", "LAX", "NYC", "SG", "HK"])
-                speed = random.uniform(0.5, 3.5)
-                source = random.choice(["📂 全量扫描", "⚡ 优质种子", "🏆 历史优秀", "🕷️ 爬虫", "💎 冷门"])
+                colo_list = ["SFO", "LAX", "NYC", "SG", "HK", "LON", "FRA", "SYD"]
+                colo = random.choice(colo_list)
+                speed = random.uniform(0.5, 5.0)  # 扩展速度范围
+                sources = ["📂 全量扫描", "⚡ 优质种子", "🏆 历史优秀", "🕷️ 爬虫", "💎 冷门"]
+                source = random.choice(sources)
                 
-                logger.info(f"IP测试成功: {ip} 延迟: {latency:.1f}ms")
+                logger.debug(f"IP测试成功: {ip} 延迟: {latency:.1f}ms 速度: {speed:.2f}MB/s")
                 return latency, colo, speed, source
                 
         except socket.timeout:
             logger.debug(f"IP测试超时: {ip}")
             return None, None, 0, "超时"
-        except (socket.error, ConnectionRefusedError) as e:
+        except (socket.error, ConnectionRefusedError, OSError) as e:
             logger.debug(f"IP测试失败: {ip} - {e}")
             return None, None, 0, "失败"
     
@@ -185,14 +220,29 @@ class IPTester:
     def test_multiple_ips(ips: List[str]) -> Dict[str, Tuple]:
         """并发测试多个IP"""
         results = {}
+        
+        # 如果没有IP需要测试，返回空字典
+        if not ips:
+            return results
+            
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+            # 为每个IP创建测试任务
             future_to_ip = {executor.submit(IPTester.test_single_ip, ip): ip for ip in ips}
+            
+            # 收集结果
             for future in concurrent.futures.as_completed(future_to_ip):
                 ip = future_to_ip[future]
                 try:
-                    results[ip] = future.result(timeout=config.TEST_TIMEOUT + 1)
+                    # 设置超时以防万一
+                    results[ip] = future.result(timeout=config.TEST_TIMEOUT + 2)
                 except concurrent.futures.TimeoutError:
                     results[ip] = (None, None, 0, "超时")
+                    logger.warning(f"IP测试任务超时: {ip}")
+                except Exception as e:
+                    results[ip] = (None, None, 0, f"错误: {str(e)[:50]}")
+                    logger.error(f"IP测试任务异常: {ip} - {e}")
+        
+        logger.info(f"完成IP批量测试，共测试 {len(ips)} 个IP，成功 {len([r for r in results.values() if r[0] is not None])} 个")
         return results
 
 # ==================== 健康度计算 ====================
@@ -204,17 +254,38 @@ class HealthScorer:
         """计算Colo稳定性"""
         if not colos:
             return 0.0
-        counter = Counter(colos[-10:])  # 只考虑最近10次
-        most_common_count = counter.most_common(1)[0][1] if counter else 0
-        return most_common_count / len(colos)
+        
+        # 只考虑最近10次结果
+        recent_colos = colos[-10:] if len(colos) > 10 else colos
+        counter = Counter(recent_colos)
+        
+        if not counter:
+            return 0.0
+            
+        most_common_count = counter.most_common(1)[0][1]
+        return most_common_count / len(recent_colos)
     
     @staticmethod
     def calculate_latency_score(latencies: List[float]) -> float:
         """计算延迟分数"""
         if not latencies:
             return 0.0
-        avg_latency = sum(latencies[-10:]) / len(latencies[-10:])
-        return max(0.0, 1.0 - min(avg_latency / 200, 1.0))
+        
+        # 只考虑最近10次结果
+        recent_latencies = latencies[-10:] if len(latencies) > 10 else latencies
+        
+        if not recent_latencies:
+            return 0.0
+            
+        avg_latency = sum(recent_latencies) / len(recent_latencies)
+        
+        # 延迟在0-50ms: 满分，50-200ms: 线性衰减，200ms以上: 0分
+        if avg_latency <= 50:
+            return 1.0
+        elif avg_latency <= 200:
+            return 1.0 - (avg_latency - 50) / 150
+        else:
+            return 0.0
     
     @staticmethod
     def calculate_success_rate(success: int, fail: int) -> float:
@@ -225,6 +296,18 @@ class HealthScorer:
         return success / total
     
     @staticmethod
+    def calculate_speed_score(speeds: List[float]) -> float:
+        """计算速度分数"""
+        if not speeds:
+            return 0.0
+            
+        recent_speeds = speeds[-5:] if len(speeds) > 5 else speeds
+        avg_speed = sum(recent_speeds) / len(recent_speeds)
+        
+        # 速度在3MB/s以上: 满分，0-3MB/s: 线性计算
+        return min(avg_speed / 3.0, 1.0)
+    
+    @staticmethod
     def calculate_health_score(stats: IPStats) -> float:
         """计算综合健康度分数"""
         if not stats.latency:
@@ -233,38 +316,60 @@ class HealthScorer:
         colo_score = HealthScorer.calculate_colo_stability(stats.colo)
         latency_score = HealthScorer.calculate_latency_score(stats.latency)
         success_score = HealthScorer.calculate_success_rate(stats.success, stats.fail)
+        speed_score = HealthScorer.calculate_speed_score(stats.speed)
         
+        # 加权计算综合分数
         health = (
             colo_score * config.WEIGHT_COLO +
             latency_score * config.WEIGHT_LATENCY +
-            success_score * config.WEIGHT_SUCCESS
+            success_score * config.WEIGHT_SUCCESS +
+            speed_score * 0.1  # 速度占10%权重
         )
         
+        # 确保分数在0-1之间
+        health = max(0.0, min(1.0, health))
         return round(health, 3)
     
     @staticmethod
     def should_switch(current_ip: Optional[str], current_stats: Optional[IPStats], 
                      candidate_stats: IPStats, scene: str) -> bool:
         """判断是否需要切换IP"""
+        # 如果当前没有IP，则切换
         if current_ip is None:
             return True
             
+        # 如果当前IP没有统计信息，则切换
         if current_stats is None:
             return True
             
         # 场景特定规则
-        if scene == "gpt" and candidate_stats.speed[-1] < config.GPT_MIN_SPEED:
-            return False
-        if scene == "stream" and candidate_stats.latency[-1] > config.STREAM_MAX_LATENCY:
-            return False
+        if scene == "gpt":
+            if candidate_stats.speed and candidate_stats.speed[-1] < config.GPT_MIN_SPEED:
+                return False
+            # GPT场景更看重速度
+            candidate_speed = HealthScorer.calculate_speed_score(candidate_stats.speed)
+            current_speed = HealthScorer.calculate_speed_score(current_stats.speed)
+            if candidate_speed < current_speed * 1.2:  # 速度没有明显提升则不切换
+                return False
+                
+        if scene == "stream":
+            if candidate_stats.latency and candidate_stats.latency[-1] > config.STREAM_MAX_LATENCY:
+                return False
+            # 流媒体场景更看重延迟
+            candidate_latency = HealthScorer.calculate_latency_score(candidate_stats.latency)
+            current_latency = HealthScorer.calculate_latency_score(current_stats.latency)
+            if candidate_latency < current_latency * 1.1:  # 延迟没有明显改善则不切换
+                return False
             
-        # 健康度提升超过阈值或当前健康度过低
+        # 获取健康度分数
         current_health = current_stats.health or 0.0
         candidate_health = candidate_stats.health
         
+        # 如果当前健康度已经很高，则不切换
         if current_health >= config.HEALTH_GOOD_THRESHOLD:
             return False
             
+        # 如果候选IP健康度提升超过阈值，则切换
         return candidate_health - current_health >= config.HEALTH_SWITCH_THRESHOLD
 
 # ==================== NekoBox配置生成 ====================
@@ -274,7 +379,7 @@ class NekoBoxGenerator:
     @staticmethod
     def generate_profile(scene: str, ip: str) -> Dict:
         """生成NekoBox配置文件"""
-        return {
+        profile = {
             "log": {"level": "warn"},
             "inbounds": [
                 {
@@ -309,6 +414,28 @@ class NekoBoxGenerator:
             ],
             "route": {"auto_detect_interface": True}
         }
+        
+        # 根据场景调整配置
+        if scene == "gpt":
+            # GPT场景可能需要不同的路由设置
+            profile["route"]["rules"] = [
+                {
+                    "type": "field",
+                    "domain": ["openai.com", "chat.openai.com", "api.openai.com"],
+                    "outboundTag": f"CF-{scene.upper()}"
+                }
+            ]
+        elif scene == "stream":
+            # 流媒体场景可能需要不同的路由设置
+            profile["route"]["rules"] = [
+                {
+                    "type": "field",
+                    "domain": ["netflix.com", "youtube.com", "twitch.tv"],
+                    "outboundTag": f"CF-{scene.upper()}"
+                }
+            ]
+        
+        return profile
     
     @staticmethod
     def save_profile(scene: str, ip: str) -> Optional[Path]:
@@ -318,7 +445,7 @@ class NekoBoxGenerator:
             file_path = config.BASE_DIR / "profiles" / f"nekobox_{scene}.json"
             
             if DataManager.save_json(file_path, profile):
-                logger.info(f"配置文件已保存: {file_path}")
+                logger.info(f"配置文件已保存: {file_path} (IP: {ip})")
                 return file_path
             return None
         except Exception as e:
@@ -332,7 +459,7 @@ class IPHunterManager:
     def __init__(self):
         self.db = DataManager.load_ip_db()
         self.state = DataManager.load_state()
-        self.fail_db = DataManager.load_json(config.FAIL_FILE, {})
+        self.fail_db = DataManager.load_fail_db()
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -344,31 +471,36 @@ class IPHunterManager:
         with self._lock:
             # 获取或创建统计对象
             ip_data = self.db.get(ip, {})
-            stats = IPStats.from_dict(ip_data) if ip_data else IPStats(
-                latency=[], colo=[], speed=[], source=source
-            )
+            stats = IPStats.from_dict(ip_data)
             
             # 更新数据
             if latency is not None:
                 stats.latency.append(latency)
-                stats.latency = stats.latency[-10:]  # 保留最近10次
+                stats.latency = stats.latency[-20:]  # 保留最近20次
                 stats.success += 1
                 
                 if colo:
                     stats.colo.append(colo)
-                    stats.colo = stats.colo[-10:]
+                    stats.colo = stats.colo[-20:]
                 
                 if speed:
                     stats.speed.append(speed)
-                    stats.speed = stats.speed[-10:]
+                    stats.speed = stats.speed[-20:]
+                    
+                # 如果是新IP，设置来源
+                if not stats.source and source:
+                    stats.source = source
             else:
                 stats.fail += 1
+                # 记录失败到独立数据库
+                self.fail_db[ip] = self.fail_db.get(ip, 0) + 1
                 
             stats.last_seen = datetime.now().isoformat()
             stats.health = HealthScorer.calculate_health_score(stats)
             
             # 保存回数据库
             self.db[ip] = stats.to_dict()
+            logger.debug(f"更新IP统计: {ip} 健康度: {stats.health} 延迟: {latency if latency else '失败'}ms")
     
     def evaluate_and_switch(self) -> None:
         """评估并切换最优IP"""
@@ -386,6 +518,14 @@ class IPHunterManager:
                 for ip, ip_data in self.db.items():
                     stats = IPStats.from_dict(ip_data)
                     
+                    # 跳过没有足够数据的IP
+                    if not stats.latency or len(stats.latency) < 3:
+                        continue
+                    
+                    # 跳过失败次数过多的IP
+                    if stats.fail > 5 and stats.success / (stats.success + stats.fail) < 0.5:
+                        continue
+                    
                     # 场景过滤
                     if scene == "gpt" and stats.speed and stats.speed[-1] < config.GPT_MIN_SPEED:
                         continue
@@ -396,20 +536,31 @@ class IPHunterManager:
                         candidate_score = stats.health
                         candidate_ip = ip
                 
+                # 如果没有找到候选IP，尝试从种子IP中选择
+                if not candidate_ip and config.SEEDS:
+                    candidate_ip = random.choice(config.SEEDS)
+                    logger.warning(f"场景 {scene} 没有合适的候选IP，使用随机种子IP: {candidate_ip}")
+                
                 if candidate_ip and candidate_ip != current_ip:
-                    candidate_stats = IPStats.from_dict(self.db[candidate_ip])
+                    candidate_stats = IPStats.from_dict(self.db.get(candidate_ip, {}))
                     if HealthScorer.should_switch(current_ip, current_stats, candidate_stats, scene):
+                        old_ip = current_ip or "无"
                         self.state[scene] = candidate_ip
                         NekoBoxGenerator.save_profile(scene, candidate_ip)
-                        logger.info(f"场景 {scene} 切换IP: {current_ip} -> {candidate_ip}")
+                        logger.info(f"场景 {scene} 切换IP: {old_ip} -> {candidate_ip}")
     
     def run_scheduler(self) -> None:
         """调度器主循环"""
         logger.info("IP猎人调度器启动")
         self._running = True
         
+        cycle_count = 0
+        
         while self._running:
             try:
+                cycle_count += 1
+                logger.debug(f"开始第 {cycle_count} 轮调度")
+                
                 # 测试种子IP
                 test_results = IPTester.test_multiple_ips(config.SEEDS)
                 
@@ -417,38 +568,59 @@ class IPHunterManager:
                 for ip, result in test_results.items():
                     self.update_ip_stats(ip, result)
                 
-                # 评估和切换
-                self.evaluate_and_switch()
-                
-                # 保存数据
-                DataManager.save_ip_db(self.db)
-                DataManager.save_state(self.state)
-                DataManager.save_json(config.FAIL_FILE, self.fail_db)
-                
-                logger.debug(f"调度完成，数据库记录数: {len(self.db)}")
+                # 每5轮进行一次评估和切换
+                if cycle_count % 5 == 0:
+                    self.evaluate_and_switch()
+                    
+                    # 保存数据
+                    DataManager.save_ip_db(self.db)
+                    DataManager.save_state(self.state)
+                    DataManager.save_fail_db(self.fail_db)
+                    
+                    logger.info(f"第 {cycle_count} 轮调度完成，数据库记录数: {len(self.db)}")
+                else:
+                    logger.debug(f"第 {cycle_count} 轮测试完成")
                 
             except Exception as e:
-                logger.error(f"调度器错误: {e}")
+                logger.error(f"调度器错误: {e}", exc_info=True)
             
+            # 等待下一轮
             time.sleep(config.UPDATE_INTERVAL)
     
     def start(self) -> None:
         """启动后台线程"""
         if not self._running:
+            logger.info("启动IP猎人后台线程")
             self._thread = threading.Thread(target=self.run_scheduler, daemon=True)
             self._thread.start()
+        else:
+            logger.warning("IP猎人后台线程已在运行")
     
     def stop(self) -> None:
         """停止后台线程"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
+        if self._running:
+            logger.info("停止IP猎人后台线程")
+            self._running = False
+            if self._thread:
+                self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    logger.warning("后台线程未能正常停止")
+        else:
+            logger.warning("IP猎人后台线程未在运行")
     
     def get_top_ips(self, n: int = 10) -> List[Dict]:
         """获取排名前N的IP"""
         with self._lock:
+            # 过滤掉没有足够数据的IP
+            valid_ips = []
+            for ip, ip_data in self.db.items():
+                stats = IPStats.from_dict(ip_data)
+                if stats.latency and len(stats.latency) >= 1:
+                    valid_ips.append((ip, ip_data))
+            
+            # 按健康度排序
             sorted_ips = sorted(
-                self.db.items(),
+                valid_ips,
                 key=lambda x: x[1].get('health', 0),
                 reverse=True
             )[:n]
@@ -456,11 +628,16 @@ class IPHunterManager:
             result = []
             for ip, data in sorted_ips:
                 stats = IPStats.from_dict(data)
+                
+                # 计算平均延迟和速度
+                avg_latency = round(sum(stats.latency[-5:]) / len(stats.latency[-5:]), 1) if stats.latency else 999
+                avg_speed = round(sum(stats.speed[-5:]) / len(stats.speed[-5:]), 2) if stats.speed else 0.0
+                
                 result.append({
                     "IP": ip,
                     "评分": stats.health,
-                    "延迟(ms)": round(stats.latency[-1], 1) if stats.latency else 999,
-                    "速度(MB/s)": round(stats.speed[-1], 2) if stats.speed else 0.0,
+                    "延迟(ms)": avg_latency,
+                    "速度(MB/s)": avg_speed,
                     "来源": stats.source,
                     "Colo": stats.colo[-1] if stats.colo else "UNK",
                     "成功率": f"{stats.success}/{stats.success + stats.fail}",
@@ -476,16 +653,82 @@ class IPHunterManager:
                 ip = self.state.get(scene)
                 if ip and ip in self.db:
                     stats = IPStats.from_dict(self.db[ip])
+                    
+                    # 计算平均延迟和速度
+                    avg_latency = round(sum(stats.latency[-3:]) / len(stats.latency[-3:]), 1) if stats.latency else 0
+                    avg_speed = round(sum(stats.speed[-3:]) / len(stats.speed[-3:]), 2) if stats.speed else 0
+                    
                     status[scene] = {
                         "ip": ip,
                         "health": stats.health,
-                        "latency": round(stats.latency[-1], 1) if stats.latency else 0,
-                        "speed": round(stats.speed[-1], 2) if stats.speed else 0,
-                        "colo": stats.colo[-1] if stats.colo else "UNK"
+                        "latency": avg_latency,
+                        "speed": avg_speed,
+                        "colo": stats.colo[-1] if stats.colo else "UNK",
+                        "last_seen": stats.last_seen[:16] if stats.last_seen else "从未"
                     }
                 else:
-                    status[scene] = {"ip": "无", "health": 0}
+                    status[scene] = {"ip": "无", "health": 0, "latency": 0, "speed": 0, "colo": "无", "last_seen": "从未"}
             return status
+    
+    def get_system_stats(self) -> Dict[str, Any]:
+        """获取系统统计信息"""
+        with self._lock:
+            total_ips = len(self.db)
+            
+            # 统计健康IP数量
+            healthy_ips = 0
+            for ip_data in self.db.values():
+                stats = IPStats.from_dict(ip_data)
+                if stats.health >= 0.7:
+                    healthy_ips += 1
+            
+            # 统计各场景使用情况
+            scene_ips = {}
+            for scene in config.SCENES:
+                ip = self.state.get(scene)
+                if ip and ip != "无":
+                    scene_ips[scene] = ip
+            
+            return {
+                "total_ips": total_ips,
+                "healthy_ips": healthy_ips,
+                "active_scenes": len([ip for ip in scene_ips.values() if ip != "无"]),
+                "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+    
+    def test_custom_ip(self, ip: str) -> Dict[str, Any]:
+        """测试自定义IP"""
+        try:
+            logger.info(f"开始测试自定义IP: {ip}")
+            latency, colo, speed, source = IPTester.test_single_ip(ip)
+            
+            result = {
+                "ip": ip,
+                "success": latency is not None,
+                "latency": round(latency, 1) if latency else None,
+                "colo": colo,
+                "speed": round(speed, 2) if speed else 0.0,
+                "source": source if latency else "测试失败"
+            }
+            
+            # 如果测试成功，更新到数据库
+            if latency is not None:
+                self.update_ip_stats(ip, (latency, colo, speed, "手动测试"))
+                # 立即保存数据库
+                DataManager.save_ip_db(self.db)
+                logger.info(f"自定义IP测试成功: {ip} 延迟: {latency:.1f}ms")
+            else:
+                logger.warning(f"自定义IP测试失败: {ip}")
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"自定义IP测试异常: {ip} - {e}")
+            return {
+                "ip": ip,
+                "success": False,
+                "error": str(e)
+            }
 
 # ==================== Streamlit前端 ====================
 class StreamlitApp:
@@ -500,22 +743,54 @@ class StreamlitApp:
         if "app_started" not in st.session_state:
             self.manager.start()
             st.session_state.app_started = True
+            st.session_state.test_history = []
         
         if "auto_refresh" not in st.session_state:
             st.session_state.auto_refresh = True
         
         if "last_refresh" not in st.session_state:
             st.session_state.last_refresh = time.time()
+        
+        if "custom_ip_test_result" not in st.session_state:
+            st.session_state.custom_ip_test_result = None
     
     def render_sidebar(self):
         """渲染侧边栏"""
         with st.sidebar:
             st.title("⚙️ 控制面板")
             
-            # 手动刷新按钮
-            if st.button("🔄 手动刷新数据", use_container_width=True):
-                st.session_state.last_refresh = time.time()
-                st.rerun()
+            # 系统状态
+            st.subheader("系统状态")
+            system_stats = self.manager.get_system_stats()
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("IP总数", system_stats["total_ips"])
+            with col2:
+                st.metric("健康IP", system_stats["healthy_ips"])
+            
+            st.metric("活跃场景", system_stats["active_scenes"])
+            st.caption(f"最后更新: {system_stats['last_update']}")
+            
+            st.divider()
+            
+            # 控制按钮
+            st.subheader("控制")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔄 手动刷新", use_container_width=True):
+                    st.session_state.last_refresh = time.time()
+                    st.rerun()
+            
+            with col2:
+                if st.button("📊 更新配置", use_container_width=True):
+                    # 强制重新评估并更新配置
+                    with st.spinner("更新配置中..."):
+                        self.manager.evaluate_and_switch()
+                        st.success("配置已更新!")
+                        time.sleep(1)
+                        st.rerun()
             
             # 自动刷新开关
             st.session_state.auto_refresh = st.toggle(
@@ -528,44 +803,92 @@ class StreamlitApp:
             
             # 添加自定义IP测试
             st.subheader("自定义IP测试")
-            custom_ip = st.text_input("输入IP地址:", placeholder="1.2.3.4")
-            if st.button("测试此IP", use_container_width=True) and custom_ip:
-                with st.spinner(f"测试IP {custom_ip}..."):
-                    result = IPTester.test_single_ip(custom_ip)
-                    latency, colo, speed, source = result
-                    if latency:
-                        st.success(f"延迟: {latency:.1f}ms | 速度: {speed:.2f}MB/s")
-                        st.info(f"Colo: {colo} | 来源: {source}")
-                    else:
-                        st.error("IP测试失败")
+            
+            # 批量测试
+            with st.expander("批量测试"):
+                ip_list = st.text_area(
+                    "输入IP列表 (每行一个)",
+                    placeholder="1.2.3.4\n5.6.7.8\n...",
+                    height=100
+                )
+                
+                if st.button("批量测试IP", use_container_width=True) and ip_list:
+                    ips = [ip.strip() for ip in ip_list.split('\n') if ip.strip()]
+                    if ips:
+                        with st.spinner(f"批量测试 {len(ips)} 个IP..."):
+                            results = IPTester.test_multiple_ips(ips)
+                            success_count = len([r for r in results.values() if r[0] is not None])
+                            st.success(f"测试完成: {success_count}/{len(ips)} 个IP成功")
+            
+            # 单个测试
+            custom_ip = st.text_input("测试单个IP:", placeholder="1.2.3.4")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("测试此IP", use_container_width=True) and custom_ip:
+                    with st.spinner(f"测试IP {custom_ip}..."):
+                        result = self.manager.test_custom_ip(custom_ip)
+                        st.session_state.custom_ip_test_result = result
+                        st.rerun()
+            
+            with col2:
+                if st.button("清空结果", use_container_width=True):
+                    st.session_state.custom_ip_test_result = None
+                    st.rerun()
+            
+            # 显示测试结果
+            if st.session_state.custom_ip_test_result:
+                result = st.session_state.custom_ip_test_result
+                if result["success"]:
+                    st.success(f"✅ 测试成功")
+                    st.info(f"""
+                    **IP:** {result['ip']}  
+                    **延迟:** {result['latency']}ms  
+                    **速度:** {result['speed']}MB/s  
+                    **Colo:** {result['colo']}  
+                    **来源:** {result['source']}
+                    """)
+                else:
+                    st.error(f"❌ 测试失败")
+                    if "error" in result:
+                        st.error(f"错误: {result['error']}")
             
             st.divider()
             
-            # 系统状态
-            st.subheader("系统状态")
-            st.metric("IP数据库", f"{len(self.manager.db)} 条记录")
-            
-            # 最后更新时间
-            elapsed = time.time() - st.session_state.last_refresh
-            st.caption(f"最后更新: {int(elapsed)}秒前")
-            
             # 操作说明
-            with st.expander("使用说明"):
+            with st.expander("📖 使用说明"):
                 st.markdown("""
+                ### 场景说明
                 1. **normal**: 普通浏览场景
-                2. **gpt**: GPT访问，要求高速
-                3. **stream**: 流媒体，要求低延迟
+                2. **gpt**: GPT访问，要求高速 (≥1MB/s)
+                3. **stream**: 流媒体，要求低延迟 (≤150ms)
                 4. **custom**: 自定义场景
                 
-                ✅ 绿色: 健康度 > 0.8  
-                ⚠️ 黄色: 健康度 0.5-0.8  
-                🔴 红色: 健康度 < 0.5
+                ### 健康度说明
+                - ✅ 绿色: 健康度 > 0.8 (优秀)
+                - ⚠️ 黄色: 健康度 0.5-0.8 (良好)
+                - 🔴 红色: 健康度 < 0.5 (较差)
+                
+                ### 自动更新
+                - 后台每30秒测试一次种子IP
+                - 每5轮测试(约2.5分钟)评估一次IP切换
+                - 配置文件自动更新
                 """)
     
     def render_main_content(self):
         """渲染主内容"""
-        st.title("🧬 Cloudflare IP 猎手")
-        st.markdown("### 多场景智能IP优选系统")
+        # 标题区域
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            st.title("🧬 Cloudflare IP 猎手")
+            st.markdown("### 多场景智能IP优选系统")
+        with col2:
+            st.metric("更新间隔", f"{config.UPDATE_INTERVAL}秒")
+        with col3:
+            status = "✅ 运行中" if st.session_state.app_started else "❌ 已停止"
+            st.metric("系统状态", status)
+        
+        st.divider()
         
         # 场景状态卡片
         st.subheader("📊 场景状态")
@@ -575,90 +898,190 @@ class StreamlitApp:
         for idx, scene in enumerate(config.SCENES):
             with cols[idx]:
                 status = scene_status[scene]
-                container = st.container(border=True)
                 
-                with container:
-                    # 根据健康度设置颜色
-                    health = status["health"]
-                    if health >= 0.8:
-                        color = "green"
-                        emoji = "✅"
-                    elif health >= 0.5:
-                        color = "orange"
-                        emoji = "⚠️"
-                    else:
-                        color = "red"
-                        emoji = "🔴"
+                # 根据健康度设置颜色和图标
+                health = status["health"]
+                if health >= 0.8:
+                    color = "green"
+                    emoji = "✅"
+                    status_text = "优秀"
+                elif health >= 0.5:
+                    color = "orange"
+                    emoji = "⚠️"
+                    status_text = "良好"
+                else:
+                    color = "red"
+                    emoji = "🔴"
+                    status_text = "较差"
+                
+                # 创建卡片
+                with st.container(border=True):
+                    st.markdown(f"### {emoji} {scene.upper()}")
                     
-                    st.markdown(f"### {scene.upper()}")
-                    st.markdown(f"**当前IP:** `{status['ip']}`")
-                    st.markdown(f"**健康度:** {emoji} **{health:.3f}**")
-                    
+                    # IP地址
                     if status["ip"] != "无":
-                        st.markdown(f"**延迟:** {status['latency']}ms")
-                        st.markdown(f"**速度:** {status['speed']}MB/s")
-                        st.markdown(f"**Colo:** {status['colo']}")
+                        st.code(status["ip"], language="text")
+                    else:
+                        st.warning("等待分配IP")
+                    
+                    # 健康度显示
+                    if status["ip"] != "无":
+                        st.progress(health, text=f"健康度: {health:.3f} ({status_text})")
+                        
+                        # 详细信息
+                        with st.expander("详细信息"):
+                            st.markdown(f"""
+                            **延迟:** {status['latency']}ms  
+                            **速度:** {status['speed']}MB/s  
+                            **Colo:** {status['colo']}  
+                            **最后检测:** {status['last_seen']}
+                            """)
+                    else:
+                        st.info("等待首次测试...")
+        
+        st.divider()
         
         # IP排行榜
         st.subheader("🏆 IP排行榜 (TOP 10)")
-        top_ips = self.manager.get_top_ips(10)
+        
+        # 添加筛选选项
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            show_count = st.slider("显示数量", 5, 20, 10)
+        with col2:
+            min_health = st.slider("最低健康度", 0.0, 1.0, 0.3, 0.1)
+        with col3:
+            sort_by = st.selectbox("排序方式", ["评分", "延迟", "速度"], index=0)
+        
+        # 获取数据
+        top_ips = self.manager.get_top_ips(20)  # 获取更多以便筛选
         
         if top_ips:
             df = pd.DataFrame(top_ips)
             
+            # 应用筛选
+            df_filtered = df[df['评分'] >= min_health].head(show_count)
+            
+            # 排序
+            if sort_by == "延迟":
+                df_filtered = df_filtered.sort_values("延迟(ms)")
+            elif sort_by == "速度":
+                df_filtered = df_filtered.sort_values("速度(MB/s)", ascending=False)
+            else:
+                df_filtered = df_filtered.sort_values("评分", ascending=False)
+            
             # 添加颜色编码
-            def color_health(val):
-                if val >= 0.8:
-                    color = "green"
-                elif val >= 0.5:
-                    color = "orange"
+            def color_row(row):
+                styles = []
+                if row['评分'] >= 0.8:
+                    styles.append('background-color: #d4edda')  # 浅绿
+                elif row['评分'] >= 0.5:
+                    styles.append('background-color: #fff3cd')  # 浅黄
                 else:
-                    color = "red"
-                return f"color: {color}; font-weight: bold"
+                    styles.append('background-color: #f8d7da')  # 浅红
+                return styles
             
-            styled_df = df.style.map(color_health, subset=['评分'])
+            styled_df = df_filtered.style.apply(color_row, axis=1)
             
+            # 显示表格
             st.dataframe(
                 styled_df,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "评分": st.column_config.NumberColumn(format="%.3f"),
+                    "IP": st.column_config.TextColumn(width="medium"),
+                    "评分": st.column_config.ProgressColumn(
+                        format="%.3f",
+                        min_value=0,
+                        max_value=1.0,
+                    ),
                     "延迟(ms)": st.column_config.NumberColumn(format="%.1f"),
-                    "速度(MB/s)": st.column_config.NumberColumn(format="%.2f")
+                    "速度(MB/s)": st.column_config.NumberColumn(format="%.2f"),
+                    "成功率": st.column_config.TextColumn(width="small"),
+                    "Colo": st.column_config.TextColumn(width="small"),
                 }
             )
+            
+            # 显示统计信息
+            if len(df_filtered) > 0:
+                avg_latency = df_filtered["延迟(ms)"].mean()
+                avg_speed = df_filtered["速度(MB/s)"].mean()
+                avg_health = df_filtered["评分"].mean()
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("平均延迟", f"{avg_latency:.1f}ms")
+                with col2:
+                    st.metric("平均速度", f"{avg_speed:.2f}MB/s")
+                with col3:
+                    st.metric("平均健康度", f"{avg_health:.3f}")
         else:
             st.info("暂无IP数据，等待后台扫描...")
+            st.progress(0, text="等待数据...")
+        
+        st.divider()
         
         # NekoBox配置文件下载
         st.subheader("📥 NekoBox 配置下载")
+        
+        # 显示下载说明
+        with st.expander("下载说明", expanded=False):
+            st.markdown("""
+            1. 点击下方对应场景的下载按钮
+            2. 下载JSON配置文件
+            3. 在NekoBox中导入配置文件
+            4. 选择对应的出站节点即可使用
+            
+            **注意:** 配置文件会根据IP自动更新，建议定期重新下载
+            """)
+        
+        # 配置文件下载区域
         profile_cols = st.columns(len(config.SCENES))
         
         for idx, scene in enumerate(config.SCENES):
             with profile_cols[idx]:
+                status = scene_status[scene]
                 profile_path = config.BASE_DIR / "profiles" / f"nekobox_{scene}.json"
+                
                 if profile_path.exists():
                     with open(profile_path, 'r') as f:
                         profile_data = f.read()
                     
+                    # 显示当前IP
+                    ip_display = status["ip"] if status["ip"] != "无" else "未分配"
+                    st.markdown(f"**当前IP:** `{ip_display}`")
+                    
+                    # 下载按钮
                     st.download_button(
                         label=f"下载 {scene.upper()}",
                         data=profile_data,
                         file_name=f"nekobox_{scene}.json",
                         mime="application/json",
-                        use_container_width=True
+                        use_container_width=True,
+                        help=f"下载{scene.upper()}场景的配置文件"
                     )
-                    st.caption(f"IP: {scene_status[scene]['ip']}")
+                    
+                    # 显示配置文件信息
+                    with st.expander("配置预览"):
+                        try:
+                            profile_json = json.loads(profile_data)
+                            st.json(profile_json, expanded=False)
+                        except:
+                            st.code(profile_data[:200] + "...", language="json")
                 else:
+                    st.warning(f"等待生成 {scene.upper()}")
                     st.button(
-                        f"等待生成 {scene.upper()}",
+                        f"{scene.upper()} 配置",
                         disabled=True,
                         use_container_width=True
                     )
+                    
+                    if status["ip"] != "无":
+                        st.info(f"将使用IP: {status['ip']}")
     
     def run(self):
         """运行Streamlit应用"""
+        # 页面配置
         st.set_page_config(
             page_title="Cloudflare IP 猎手",
             page_icon="🧬",
@@ -679,21 +1102,70 @@ class StreamlitApp:
         
         # 页脚信息
         st.divider()
-        st.caption(f"""
-        🕐 后台每 {config.UPDATE_INTERVAL} 秒自动更新 | 
-        📊 数据库: {len(self.manager.db)} 个IP | 
-        🔄 最后刷新: {datetime.now().strftime('%H:%M:%S')}
-        """)
+        
+        # 系统信息
+        system_stats = self.manager.get_system_stats()
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.caption(f"🕐 更新间隔: {config.UPDATE_INTERVAL}秒")
+        with col2:
+            st.caption(f"📊 数据库: {system_stats['total_ips']}个IP")
+        with col3:
+            st.caption(f"✅ 健康IP: {system_stats['healthy_ips']}个")
+        with col4:
+            current_time = datetime.now().strftime('%H:%M:%S')
+            st.caption(f"🔄 最后刷新: {current_time}")
+        
+        # 调试信息（仅在需要时显示）
+        if st.sidebar.checkbox("显示调试信息", False):
+            st.sidebar.divider()
+            st.sidebar.subheader("调试信息")
+            
+            # 显示后台线程状态
+            thread_status = "运行中" if hasattr(self.manager, '_thread') and self.manager._thread and self.manager._thread.is_alive() else "停止"
+            st.sidebar.text(f"后台线程: {thread_status}")
+            
+            # 显示数据库大小
+            db_size = Path(config.DB_FILE).stat().st_size if Path(config.DB_FILE).exists() else 0
+            st.sidebar.text(f"数据库大小: {db_size / 1024:.1f} KB")
+            
+            # 显示日志最后几行
+            if Path(config.LOG_FILE).exists():
+                with open(config.LOG_FILE, 'r') as f:
+                    lines = f.readlines()
+                    if lines:
+                        st.sidebar.text("最近日志:")
+                        for line in lines[-5:]:
+                            st.sidebar.text(line.strip())
 
 # ==================== 应用入口 ====================
 def main():
     """主函数"""
     try:
+        # 显示启动信息
+        logger.info("启动Cloudflare IP猎手应用")
+        logger.info(f"数据目录: {config.BASE_DIR / 'data'}")
+        logger.info(f"配置目录: {config.BASE_DIR / 'profiles'}")
+        logger.info(f"种子IP数量: {len(config.SEEDS)}")
+        logger.info(f"场景数量: {len(config.SCENES)}")
+        
+        # 创建并运行应用
         app = StreamlitApp()
         app.run()
+        
     except Exception as e:
-        logger.error(f"应用启动失败: {e}")
+        logger.error(f"应用启动失败: {e}", exc_info=True)
+        
+        # 在界面上显示错误
+        st.set_page_config(page_title="错误 - Cloudflare IP 猎手")
         st.error(f"应用启动失败: {e}")
+        st.code(str(e), language="text")
+        
+        # 显示调试信息
+        with st.expander("调试信息"):
+            import traceback
+            st.code(traceback.format_exc(), language="text")
 
 if __name__ == "__main__":
     main()
