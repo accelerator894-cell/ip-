@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import time, threading, random, socket, json
 from pathlib import Path
-from collections import defaultdict, Counter
+from collections import Counter
 
+# ------------------ 配置 ------------------
 BASE = Path(".")
 DB_FILE = BASE / "ip_db.json"
 STATE_FILE = BASE / "state.json"
@@ -15,10 +16,10 @@ REALITY_SID = "填写你的shortid"
 SNI = "www.cloudflare.com"
 
 SCENES = ["normal", "gpt", "stream"]
-FINGERPRINT = {"normal":"chrome", "gpt":"firefox", "stream":"safari"}
+FINGERPRINT = {"normal": "chrome", "gpt": "firefox", "stream": "safari"}
 SEEDS = ["104.19.19.19", "104.18.20.126", "172.64.198.1", "172.67.1.1"]
 
-# ---------- 文件操作 ----------
+# ------------------ 文件操作 ------------------
 def load(path, default):
     if not path.exists(): return default
     return json.loads(path.read_text())
@@ -26,7 +27,7 @@ def load(path, default):
 def save(path, data):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-# ---------- IP 测试 ----------
+# ------------------ IP 测试 ------------------
 def test_ip(ip):
     try:
         s = socket.socket()
@@ -35,13 +36,12 @@ def test_ip(ip):
         s.connect((ip, 443))
         latency = (time.time() - t0) * 1000
         s.close()
-        # colo 测试
         colo = random.choice(["SFO","LAX","NYC","SG","HK"])
         return latency, colo
     except:
         return None, None
 
-# ---------- 健康度模型 ----------
+# ------------------ 健康度模型 ------------------
 def colo_stability(colos):
     if not colos: return 0
     c = Counter(colos)
@@ -60,7 +60,7 @@ def should_switch(cur, cand):
     if cur.get("health",0) >= 0.85: return False
     return cand["health"] - cur.get("health",0) >= 0.15
 
-# ---------- NekoBox JSON ----------
+# ------------------ NekoBox JSON ------------------
 def export_nekobox(scene, ip):
     profile = {
         "log": {"level": "warn"},
@@ -89,7 +89,7 @@ def export_nekobox(scene, ip):
     save(file_path, profile)
     return file_path
 
-# ---------- 后台线程 ----------
+# ------------------ 后台线程 ------------------
 def scheduler():
     db = load(DB_FILE,{})
     state = load(STATE_FILE,{})
@@ -120,7 +120,7 @@ def scheduler():
         save(FAIL_FILE,fail)
         time.sleep(10)
 
-# ---------- Streamlit 前端 ----------
+# ------------------ Streamlit 前端 ------------------
 if "started" not in st.session_state:
     threading.Thread(target=scheduler,daemon=True).start()
     st.session_state.started = True
@@ -130,9 +130,22 @@ st.title("Cloudflare IP 猎手 · Streamlit版")
 db = load(DB_FILE,{})
 state = load(STATE_FILE,{})
 
-# 显示前 10
-df = pd.DataFrame([{"ip":ip,"score":v.get("health",0),"latency":v.get("latency")[-1] if v.get("latency") else 0,"colo":v.get("colo")[-1] if v.get("colo") else "UNK"} for ip,v in db.items()])
-df = df.sort_values("score",ascending=False).head(10)
+# 构造 DataFrame，保证 score 列存在
+rows = []
+for ip, v in db.items():
+    rows.append({
+        "ip": ip,
+        "score": v.get("health",0),
+        "latency": v.get("latency")[-1] if v.get("latency") else 0,
+        "colo": v.get("colo")[-1] if v.get("colo") else "UNK"
+    })
+
+if rows:
+    df = pd.DataFrame(rows)
+else:
+    df = pd.DataFrame(columns=["ip","score","latency","colo"])
+
+df = df.sort_values("score", ascending=False).head(10)
 st.dataframe(df)
 
 st.subheader("NekoBox 下载链接")
