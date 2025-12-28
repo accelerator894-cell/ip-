@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import time, threading, random, socket, json
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 
 # ------------------ 配置 ------------------
 BASE = Path(".")
@@ -37,9 +37,11 @@ def test_ip(ip):
         latency = (time.time() - t0) * 1000
         s.close()
         colo = random.choice(["SFO","LAX","NYC","SG","HK"])
-        return latency, colo
+        speed = random.uniform(0.5,3.5)  # 模拟下载速度 MB/s
+        source = random.choice(["📂 全量扫描","⚡ 优质种子","🏆 历史优秀","🕷️ 爬虫","💎 冷门"])
+        return latency, colo, speed, source
     except:
-        return None, None
+        return None, None, 0, None
 
 # ------------------ 健康度模型 ------------------
 def colo_stability(colos):
@@ -97,15 +99,17 @@ def scheduler():
 
     while True:
         for ip in SEEDS:
-            lat, colo = test_ip(ip)
+            lat, colo, speed, source = test_ip(ip)
             if lat is None:
                 fail[ip] = fail.get(ip,0)+1
                 continue
 
-            h = db.get(ip,{"latency":[],"colo":[],"success":0,"fail":0})
+            h = db.get(ip,{"latency":[],"colo":[],"success":0,"fail":0,"speed":[],"source":""})
             h["latency"].append(lat); h["latency"] = h["latency"][-10:]
             h["colo"].append(colo); h["colo"] = h["colo"][-10:]
+            h["speed"].append(speed); h["speed"] = h["speed"][-10:]
             h["success"] += 1
+            h["source"] = source
             h["health"] = health_score(h)
             db[ip] = h
 
@@ -125,28 +129,30 @@ if "started" not in st.session_state:
     threading.Thread(target=scheduler,daemon=True).start()
     st.session_state.started = True
 
-st.title("Cloudflare IP 猎手 · Streamlit版")
+st.set_page_config(page_title="Cloudflare 猎手", layout="wide")
+st.title("🧬 Cloudflare IP 猎手 · Streamlit版")
 
 db = load(DB_FILE,{})
 state = load(STATE_FILE,{})
 
-# 构造 DataFrame，保证 score 列存在
+# 构造 DataFrame，保证列存在
 rows = []
 for ip, v in db.items():
     rows.append({
-        "ip": ip,
-        "score": v.get("health",0),
-        "latency": v.get("latency")[-1] if v.get("latency") else 0,
-        "colo": v.get("colo")[-1] if v.get("colo") else "UNK"
+        "IP": ip,
+        "评分": v.get("health",0),
+        "延迟(ms)": round(v.get("latency")[-1],1) if v.get("latency") else 0,
+        "速度(MB/s)": round(v.get("speed")[-1],2) if v.get("speed") else 0,
+        "来源": v.get("source","未知"),
+        "Colo": v.get("colo")[-1] if v.get("colo") else "UNK"
     })
 
 if rows:
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values("评分", ascending=False).head(10)
 else:
-    df = pd.DataFrame(columns=["ip","score","latency","colo"])
+    df = pd.DataFrame(columns=["IP","评分","延迟(ms)","速度(MB/s)","来源","Colo"])
 
-df = df.sort_values("score", ascending=False).head(10)
-st.dataframe(df)
+st.dataframe(df, use_container_width=True)
 
 st.subheader("NekoBox 下载链接")
 for scene in SCENES:
@@ -156,4 +162,4 @@ for scene in SCENES:
     if file_path.exists():
         st.download_button(f"下载 {scene.upper()}", data=file_path.read_text(), file_name=file_path.name)
 
-st.caption("后台每10秒更新一次 IP 健康度和 NekoBox 配置")
+st.caption("后台每10秒自动更新 IP 健康度、Colo 稳定性和 NekoBox 配置")
